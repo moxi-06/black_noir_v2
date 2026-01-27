@@ -307,30 +307,28 @@ async function searchFiles(query, page = 0, filters = {}) {
 
         // Build query with filters
         let searchQuery = {};
+        const conditions = [];
 
         // Use regex for basic search
         if (query) {
-            searchQuery.file_name = new RegExp(query, 'i');
+            conditions.push({ file_name: { $regex: new RegExp(query, 'i') } });
         }
 
-        // Add filters
+        // Add filters (now additive)
         if (filters.language) {
-            searchQuery.file_name = {
-                ...searchQuery.file_name,
-                $regex: new RegExp(filters.language, 'i')
-            };
+            conditions.push({ file_name: { $regex: new RegExp(filters.language, 'i') } });
         }
         if (filters.year) {
-            searchQuery.file_name = {
-                ...searchQuery.file_name,
-                $regex: new RegExp(filters.year, 'i')
-            };
+            conditions.push({ file_name: { $regex: new RegExp(filters.year, 'i') } });
         }
         if (filters.quality) {
-            searchQuery.file_name = {
-                ...searchQuery.file_name,
-                $regex: new RegExp(filters.quality, 'i')
-            };
+            conditions.push({ file_name: { $regex: new RegExp(filters.quality, 'i') } });
+        }
+
+        if (conditions.length > 1) {
+            searchQuery = { $and: conditions };
+        } else if (conditions.length === 1) {
+            searchQuery = conditions[0];
         }
 
         const results = await filesCollection
@@ -392,11 +390,8 @@ async function generateKeyboard(files, query, page, hasNext, hasPrev, userId = n
         const filterRow1 = [];
         const filterRow2 = [];
 
-        // Language filter
         filterRow1.push(Markup.button.callback('🌐 Language', `filter_lang_${query}`));
-        // Year filter
         filterRow1.push(Markup.button.callback('📅 Year', `filter_year_${query}`));
-        // Quality filter
         filterRow2.push(Markup.button.callback('✨ Quality', `filter_qual_${query}`));
 
         buttons.push(filterRow1);
@@ -578,6 +573,46 @@ bot.action('check_sub', async (ctx) => {
     }
 });
 
+// Helper: Show Home/Welcome Menu
+async function showWelcome(ctx) {
+    const welcomeText = `🎬 *Noir Premium Filter Bot* 🍿
+
+🚀 *The fastest way to find movies!*
+
+✨ *Features:*
+└ 🔍 AI Smart Search
+└ 🗣️ Multi-Language Support
+└ 💎 HD Quality Filters
+└ 🤝 Referral Program
+
+🔥 *Trending Right Now:*
+${await getTrendingText()}
+
+💡 *Just type a movie name below to start!*`;
+
+    const keyboard = Markup.inlineKeyboard([
+        [Markup.button.callback('🔥 Trending', 'show_trending')],
+        [Markup.button.callback('🤝 Refer & Earn', 'show_refer')],
+        [Markup.button.callback('📊 Stats', 'show_stats'), Markup.button.callback('❓ Help', 'show_help')]
+    ]);
+
+    if (ctx.updateType === 'callback_query') {
+        try {
+            await ctx.editMessageText(welcomeText, { parse_mode: 'Markdown', ...keyboard });
+        } catch (e) {
+            await ctx.reply(welcomeText, { parse_mode: 'Markdown', ...keyboard });
+        }
+        await ctx.answerCbQuery();
+    } else {
+        await ctx.reply(welcomeText, { parse_mode: 'Markdown', ...keyboard });
+    }
+}
+
+// Handle show_home action
+bot.action('show_home', async (ctx) => {
+    return showWelcome(ctx);
+});
+
 bot.start(async (ctx) => {
     if (!await checkUser(ctx)) return;
     const startPayload = ctx.startPayload;
@@ -613,32 +648,7 @@ bot.start(async (ctx) => {
         await sendFile(ctx, fileId);
         return;
     } else {
-        // Enhanced welcome message
-        const welcomeText = `🎬 *Noir Premium Filter Bot* 🍿
-
-🚀 *The fastest way to find movies!*
-
-✨ *Features:*
-└ 🔍 AI Smart Search
-└ 🗣️ Multi-Language Support
-└ 💎 HD Quality Filters
-└ 🤝 Referral Program
-
-🔥 *Trending Right Now:*
-${await getTrendingText()}
-
-💡 *Just type a movie name below to start!*`;
-
-        const keyboard = Markup.inlineKeyboard([
-            [Markup.button.callback('🔥 Trending', 'show_trending')],
-            [Markup.button.callback('🤝 Refer & Earn', 'show_refer')],
-            [Markup.button.callback('📊 Stats', 'show_stats'), Markup.button.callback('❓ Help', 'show_help')]
-        ]);
-
-        await ctx.reply(welcomeText, {
-            parse_mode: 'Markdown',
-            ...keyboard
-        });
+        await showWelcome(ctx);
     }
 });
 
@@ -733,19 +743,27 @@ bot.command('stats', async (ctx) => {
 ⏱️ *Uptime:* ${uptime}
 📁 *Total Files:* ${stats.totalFiles}
 💾 *Database Size:* ${stats.sizeInMB} MB
-🗄️ *Storage Size:* ${stats.storageSizeInMB} MB
 
 🤖 *Bot Info:*
 👤 Admin: ${ctx.from.first_name}
 🆔 User ID: ${ctx.from.id}`;
 
-        await ctx.reply(statsText, { parse_mode: 'Markdown' });
+        const keyboard = Markup.inlineKeyboard([
+            [Markup.button.callback('🔙 Back', 'show_home')]
+        ]);
+
+        if (ctx.updateType === 'callback_query') {
+            await ctx.editMessageText(statsText, { parse_mode: 'Markdown', ...keyboard });
+            await ctx.answerCbQuery();
+        } else {
+            await ctx.reply(statsText, { parse_mode: 'Markdown', ...keyboard });
+        }
     } else {
-        await ctx.reply('❌ Error fetching statistics.');
+        await ctx.answerCbQuery('Error fetching stats');
     }
 });
 
-// Handle stats button callback
+// Handle show_stats button callback
 bot.action('show_stats', async (ctx) => {
     const stats = await getDatabaseStats();
     const uptime = getUptime();
@@ -755,10 +773,17 @@ bot.action('show_stats', async (ctx) => {
 
 ⏱️ *Uptime:* ${uptime}
 📁 *Total Files:* ${stats.totalFiles}
-💾 *Database Size:* ${stats.sizeInMB} MB`;
+💾 *Database Size:* ${stats.sizeInMB} MB
 
+👤 User: ${ctx.from.first_name}
+🆔 ID: ${ctx.from.id}`;
+
+        const keyboard = Markup.inlineKeyboard([
+            [Markup.button.callback('🔙 Back', 'show_home')]
+        ]);
+
+        await ctx.editMessageText(statsText, { parse_mode: 'Markdown', ...keyboard });
         await ctx.answerCbQuery();
-        await ctx.reply(statsText, { parse_mode: 'Markdown' });
     } else {
         await ctx.answerCbQuery('Error fetching stats');
     }
@@ -770,16 +795,24 @@ bot.action('show_refer', async (ctx) => {
     const refLink = `https://t.me/${bot.botInfo.username}?start=ref_${ctx.from.id}`;
     const refCount = user.referrals || 0;
 
-    const referText = `🤝 *Noir Referral Program*\n\n` +
-        `Invite your friends and grow our community! \n\n` +
-        `📈 *Your Stats:* \n` +
-        `└ Referred Users: \`${refCount}\` \n\n` +
-        `🔗 *Your Unique Link:* \n` +
-        `\`${refLink}\` \n\n` +
-        `_Copy and share this link to earn referrals!_`;
+    const referText = `🤝 *Noir Referral Program*
+
+Invite your friends and grow our community! 
+
+📈 *Your Stats:* 
+└ Referred Users: \`${refCount}\` 
+
+🔗 *Your Unique Link:* 
+\`${refLink}\` 
+
+_Copy and share this link to earn referrals!_`;
+
+    const keyboard = Markup.inlineKeyboard([
+        [Markup.button.callback('🔙 Back', 'show_home')]
+    ]);
 
     await ctx.answerCbQuery();
-    await ctx.reply(referText, { parse_mode: 'Markdown' });
+    await ctx.editMessageText(referText, { parse_mode: 'Markdown', ...keyboard });
 });
 
 // Handle request button action
@@ -846,6 +879,27 @@ bot.command('block', async (ctx) => {
     if (!word) return ctx.reply('Usage: /block <word>');
     await blockedKeywordsCollection.updateOne({ word: word.toLowerCase() }, { $set: { word: word.toLowerCase() } }, { upsert: true });
     await ctx.reply(`✅ *Blocked:* \`${word}\``, { parse_mode: 'Markdown' });
+});
+
+// Admin File Deletion Command
+bot.command('delete', async (ctx) => {
+    if (!isAdmin(ctx.from.id)) return;
+    const query = ctx.message.text.split(' ').slice(1).join(' ');
+    if (!query) return ctx.reply('Usage: /delete <movie name>');
+
+    const searchResult = await searchFiles(query, 0);
+    if (searchResult.files.length === 0) {
+        return ctx.reply(`❌ No files found for \`${query}\``, { parse_mode: 'Markdown' });
+    }
+
+    const buttons = searchResult.files.map(file => [
+        Markup.button.callback(`🗑️ ${file.file_name}`, `delete_confirm_${file._id}`)
+    ]);
+
+    await ctx.reply(`🛠️ *Select file to delete from Database:*`, {
+        parse_mode: 'Markdown',
+        ...Markup.inlineKeyboard(buttons)
+    });
 });
 
 // Unblock Keyword
@@ -928,7 +982,7 @@ async function triggerAdminRefresh(ctx) {
     const adminText = `🛠️ *Admin Dashboard*\n\n` +
         `🚦 *Maintenance:* ${IS_MAINTENANCE ? '🔴 ON' : '🟢 OFF'}\n` +
         `👁️ *Monetization:* ${IS_GROWTH_LOCK ? '🟢 AUTO' : '🔴 DISABLED'}\n` +
-        `� *Tracking Channel:* \`${FSUB_CHANNEL_ID || 'Not Set'}\`\n` +
+        ` *Tracking Channel:* \`${FSUB_CHANNEL_ID || 'Not Set'}\`\n` +
         `📦 *Last Post ID:* \`${LAST_FSUB_POST_ID || 'Waiting...'}\`\n\n` +
         `📊 *Total Stats:* \n` +
         `└ Users: \`${stats.totalUsers}\` \n` +
@@ -946,33 +1000,25 @@ async function triggerAdminRefresh(ctx) {
 // Handle trending action
 bot.action('show_trending', async (ctx) => {
     const trendingText = await getTrendingText();
+    const keyboard = Markup.inlineKeyboard([
+        [Markup.button.callback('🔙 Back', 'show_home')]
+    ]);
     await ctx.answerCbQuery();
-    await ctx.reply(`🔥 *Trending Movies This Week:*\n\n${trendingText}\n\n_Type any of these to get them!_`, { parse_mode: 'Markdown' });
+    await ctx.editMessageText(`🔥 *Trending Movies This Week:*\n\n${trendingText}\n\n_Type any of these to get them!_`, { parse_mode: 'Markdown', ...keyboard });
 });
 
 // Handle help button callback
 bot.action('show_help', async (ctx) => {
     const helpText = `🎬 *Noir Premium Help Menu* 🍿
-
-*How to Search:*
-• Simply type the movie name (e.g., "Avengers")
-• Typos are okay! Our AI will find it.
-• Use the **✨ Quality** button to filter.
-
-*Referral Program:*
-• Invite friends using your link in the "Refer & Earn" section.
-• Top referrers get premium perks!
-
-*Request System:*
-• Not finding what you want? Click the **🆘 Request** button that appears!
-
-*Auto-Delete:*
-• Files sent in Private Chat auto-delete after ${AUTO_DELETE_SECONDS} seconds to protect our server.
-
+...
 _Powered by Noir Advanced Indexer_`;
 
+    const keyboard = Markup.inlineKeyboard([
+        [Markup.button.callback('🔙 Back', 'show_home')]
+    ]);
+
     await ctx.answerCbQuery();
-    await ctx.reply(helpText, { parse_mode: 'Markdown' });
+    await ctx.editMessageText(helpText, { parse_mode: 'Markdown', ...keyboard });
 });
 
 // Handle pagination callbacks
@@ -1018,16 +1064,16 @@ bot.action(/^filter_(lang|year|qual)_(.+)$/, async (ctx) => {
     const searchResult = await searchFiles(query, 0);
     const items = new Set();
 
-    searchResult.files.forEach(file => {
-        const parsed = parseFileName(file.file_name);
-        if (filterType === 'lang' && parsed.language) {
-            items.add(parsed.language);
-        } else if (filterType === 'year' && parsed.year) {
-            items.add(parsed.year);
-        } else if (filterType === 'qual' && parsed.quality) {
-            items.add(parsed.quality);
-        }
-    });
+    if (filterType === 'lang') {
+        searchResult.files.forEach(file => {
+            const parsed = parseFileName(file.file_name);
+            if (parsed.language) items.add(parsed.language);
+        });
+    } else if (filterType === 'year') {
+        ['2025', '2024', '2023', '2022', '2021', '2020'].forEach(year => items.add(year));
+    } else if (filterType === 'qual') {
+        ['4K', '1080p', '720p', '480p', 'Cam'].forEach(q => items.add(q));
+    }
 
     if (items.size === 0) {
         const typeName = filterType === 'lang' ? 'languages' : (filterType === 'year' ? 'years' : 'qualities');
@@ -1035,17 +1081,23 @@ bot.action(/^filter_(lang|year|qual)_(.+)$/, async (ctx) => {
         return;
     }
 
-    // Create filter buttons
-    const buttons = Array.from(items).map(item => [
-        Markup.button.callback(item, `apply_${filterType}_${item}_${query}`)
-    ]);
+    // Create filter buttons (grid style for better look)
+    const buttons = [];
+    const itemList = Array.from(items);
+    for (let i = 0; i < itemList.length; i += 2) {
+        const row = [Markup.button.callback(itemList[i], `apply_${filterType}_${itemList[i]}_${query}`)];
+        if (itemList[i + 1]) {
+            row.push(Markup.button.callback(itemList[i + 1], `apply_${filterType}_${itemList[i + 1]}_${query}`));
+        }
+        buttons.push(row);
+    }
 
-    buttons.push([Markup.button.callback('« Back', `back_${query}`)]);
+    buttons.push([Markup.button.callback('« Back to Results', `back_${query}`)]);
 
     const title = filterType === 'lang' ? 'Language' : (filterType === 'year' ? 'Year' : 'Quality');
     await ctx.editMessageText(
         `Select ${title}:`,
-        Markup.inlineKeyboard(buttons)
+        { reply_markup: Markup.inlineKeyboard(buttons).reply_markup }
     );
     await ctx.answerCbQuery();
 });
@@ -1082,6 +1134,57 @@ bot.action(/^apply_(lang|year|qual)_(.+)_(.+)$/, async (ctx) => {
         `🔍 Results for "${query}" (${typeTitle}: ${filterValue})`,
         keyboard
     );
+    await ctx.answerCbQuery();
+});
+
+// Handle back button
+bot.action(/^delete_confirm_(.+)$/, async (ctx) => {
+    if (!isAdmin(ctx.from.id)) return;
+    const fileId = ctx.match[1];
+    const file = await filesCollection.findOne({ _id: fileId });
+
+    if (!file) {
+        return ctx.answerCbQuery('❌ File not found in DB', { show_alert: true });
+    }
+
+    const keyboard = Markup.inlineKeyboard([
+        [Markup.button.callback('✅ Yes, Delete', `delete_execute_${fileId}`)],
+        [Markup.button.callback('❌ Cancel', 'delete_cancel')]
+    ]);
+
+    await ctx.editMessageText(
+        `⚠️ *Are you sure you want to delete this file?*\n\n` +
+        `📁 *Name:* ${file.file_name}\n` +
+        `🆔 *ID:* \`${fileId}\`\n\n` +
+        `This action cannot be undone.`,
+        { parse_mode: 'Markdown', ...keyboard }
+    );
+    await ctx.answerCbQuery();
+});
+
+bot.action(/^delete_execute_(.+)$/, async (ctx) => {
+    if (!isAdmin(ctx.from.id)) return;
+    const fileId = ctx.match[1];
+    const file = await filesCollection.findOne({ _id: fileId });
+
+    if (file) {
+        await filesCollection.deleteOne({ _id: fileId });
+        await ctx.editMessageText(`✅ *Deleted Successfully!*\n\n📁 ${file.file_name}`, { parse_mode: 'Markdown' });
+
+        await sendLog(
+            `🗑️ *File Deleted by Admin*\n\n` +
+            `📁 *File:* ${file.file_name}\n` +
+            `🆔 *ID:* \`${fileId}\`\n` +
+            `👤 *Admin:* ${ctx.from.first_name} (${ctx.from.id})`
+        );
+    } else {
+        await ctx.editMessageText('❌ File was already deleted or not found.');
+    }
+    await ctx.answerCbQuery('Deleted!');
+});
+
+bot.action('delete_cancel', async (ctx) => {
+    await ctx.editMessageText('❌ Deletion cancelled.');
     await ctx.answerCbQuery();
 });
 
@@ -1236,6 +1339,11 @@ bot.on('document', async (ctx) => {
                 `💾 *Size:* ${formatFileSize(document.file_size)}\n` +
                 `👤 *Admin:* ${ctx.from.first_name} (${ctx.from.id})`
             );
+        } else if (result.duplicate) {
+            const keyboard = Markup.inlineKeyboard([
+                [Markup.button.callback('🗑️ Delete from DB', `delete_confirm_${document.file_id}`)]
+            ]);
+            await ctx.reply(`⚠️ *File already indexed:*\n📁 ${document.file_name}\n\nDo you want to remove it?`, { parse_mode: 'Markdown', ...keyboard });
         } else {
             await ctx.reply(`⚠️ ${result.message}`);
         }
