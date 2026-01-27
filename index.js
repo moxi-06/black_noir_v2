@@ -6,8 +6,8 @@ const Fuse = require('fuse.js');
 // Configuration
 const BOT_TOKEN = process.env.BOT_TOKEN;
 const MONGO_URI = process.env.MONGO_URI;
-const DB_NAME = process.env.DB_NAME;
-const COLLECTION_NAME = process.env.COLLECTION_NAME;
+const DB_NAME = process.env.DB_NAME || 'AutofilterBot';
+const COLLECTION_NAME = process.env.COLLECTION_NAME || 'Files';
 const ADMIN_IDS = process.env.ADMIN_IDS ? process.env.ADMIN_IDS.split(',').map(id => parseInt(id.trim())) : [];
 const DATABASE_CHANNEL_ID = process.env.DATABASE_CHANNEL_ID ? parseInt(process.env.DATABASE_CHANNEL_ID) : null;
 const LOG_CHANNEL_ID = process.env.LOG_CHANNEL_ID ? parseInt(process.env.LOG_CHANNEL_ID) : null;
@@ -29,14 +29,27 @@ const BOT_START_TIME = Date.now();
 const pendingIndexing = new Map();
 
 // Validate environment variables
-if (!BOT_TOKEN || !MONGO_URI || !DB_NAME || !COLLECTION_NAME) {
-    console.error('❌ Missing required environment variables!');
-    console.error('Please set: BOT_TOKEN, MONGO_URI, DB_NAME, COLLECTION_NAME');
+const requiredVars = ['BOT_TOKEN', 'MONGO_URI'];
+console.log('🔍 Environment Check:');
+Object.keys(process.env).forEach(key => {
+    if (requiredVars.includes(key) || key.includes('CHANNEL_ID') || key === 'ADMIN_IDS') {
+        const val = process.env[key];
+        console.log(`✅ Detected Key: ${key} (${val ? 'FOUND' : 'EMPTY/NULL'})`);
+    }
+});
+
+if (!BOT_TOKEN || !MONGO_URI) {
+    console.error('❌ CRITICAL ERROR: Missing BOT_TOKEN or MONGO_URI');
+    console.error('Check your Koyeb Dashboard > Environment Variables.');
     process.exit(1);
 }
 
+// Trim tokens to avoid space issues
+const FINAL_BOT_TOKEN = BOT_TOKEN.trim();
+const FINAL_MONGO_URI = MONGO_URI.trim();
+
 // Initialize bot
-const bot = new Telegraf(BOT_TOKEN);
+const bot = new Telegraf(FINAL_BOT_TOKEN);
 
 // MongoDB client
 let db;
