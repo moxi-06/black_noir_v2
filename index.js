@@ -30,6 +30,16 @@ const BOT_START_TIME = Date.now();
 // Store pending indexing operations
 const pendingIndexing = new Map();
 
+// 📡 Immediate Health Check Server (Critical for Koyeb)
+const http = require('http');
+const port = process.env.PORT || 8080;
+http.createServer((req, res) => {
+    res.writeHead(200, { 'Content-Type': 'text/plain' });
+    res.end('Bot is running!');
+}).listen(port, () => {
+    console.log(`📡 Health check server live on port ${port}`);
+});
+
 // Validate environment variables
 const requiredVars = ['BOT_TOKEN', 'MONGO_URI'];
 console.log('🔍 Environment Check:');
@@ -1534,15 +1544,6 @@ async function startBot() {
     await bot.launch();
     console.log('✅ Bot is running with all advanced features...');
     console.log(`⏱️  Auto-delete timer: ${AUTO_DELETE_SECONDS} seconds`);
-
-    // Simple HTTP server for health checks (required by some hosting providers)
-    const http = require('http');
-    const port = process.env.PORT || 8080;
-    http.createServer((req, res) => {
-        res.writeHead(200, { 'Content-Type': 'text/plain' });
-        res.end('Bot is running!');
-    }).listen(port);
-    console.log(`📡 Health check server listening on port ${port}`);
 
     // Self-pinging utility to keep the bot alive (Improved for Koyeb)
     const APP_URL = process.env.APP_URL;
