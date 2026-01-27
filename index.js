@@ -1,0 +1,1428 @@
+require('dotenv').config();
+const { Telegraf, Markup } = require('telegraf');
+const { MongoClient } = require('mongodb');
+const Fuse = require('fuse.js');
+
+// Configuration
+const BOT_TOKEN = process.env.BOT_TOKEN;
+const MONGO_URI = process.env.MONGO_URI;
+const DB_NAME = process.env.DB_NAME;
+const COLLECTION_NAME = process.env.COLLECTION_NAME;
+const ADMIN_IDS = process.env.ADMIN_IDS ? process.env.ADMIN_IDS.split(',').map(id => parseInt(id.trim())) : [];
+const DATABASE_CHANNEL_ID = process.env.DATABASE_CHANNEL_ID ? parseInt(process.env.DATABASE_CHANNEL_ID) : null;
+const LOG_CHANNEL_ID = process.env.LOG_CHANNEL_ID ? parseInt(process.env.LOG_CHANNEL_ID) : null;
+const FSUB_CHANNEL_ID = process.env.FSUB_CHANNEL_ID ? parseInt(process.env.FSUB_CHANNEL_ID) : null;
+const FSUB_LINK = process.env.FSUB_LINK || '';
+
+// God-Mode Configs
+let IS_MAINTENANCE = process.env.IS_MAINTENANCE === 'true';
+let IS_GROWTH_LOCK = process.env.IS_GROWTH_LOCK === 'true';
+let LAST_FSUB_POST_ID = null;
+
+const RESULTS_PER_PAGE = 10;
+const AUTO_DELETE_SECONDS = 3600;
+
+// Bot start time for uptime tracking
+const BOT_START_TIME = Date.now();
+
+// Store pending indexing operations
+const pendingIndexing = new Map();
+
+// Validate environment variables
+if (!BOT_TOKEN || !MONGO_URI || !DB_NAME || !COLLECTION_NAME) {
+    console.error('❌ Missing required environment variables!');
+    console.error('Please set: BOT_TOKEN, MONGO_URI, DB_NAME, COLLECTION_NAME');
+    process.exit(1);
+}
+
+// Initialize bot
+const bot = new Telegraf(BOT_TOKEN);
+
+// MongoDB client
+let db;
+let filesCollection;
+let usersCollection;
+let trendingCollection;
+let requestsCollection;
+let settingsCollection;
+let blockedKeywordsCollection;
+
+// Connect to MongoDB
+async function connectDB() {
+    try {
+        const client = new MongoClient(MONGO_URI);
+        await client.connect();
+        console.log('✅ Connected to MongoDB');
+
+        db = client.db(DB_NAME);
+        filesCollection = db.collection(COLLECTION_NAME);
+        usersCollection = db.collection('users');
+        trendingCollection = db.collection('trending');
+        requestsCollection = db.collection('requests');
+        settingsCollection = db.collection('settings');
+        blockedKeywordsCollection = db.collection('blocked_keywords');
+
+        // Load settings
+        const mnt = await settingsCollection.findOne({ key: 'maintenance' });
+        if (mnt) IS_MAINTENANCE = mnt.value;
+
+        const gl = await settingsCollection.findOne({ key: 'growth_lock' });
+        if (gl) IS_GROWTH_LOCK = gl.value;
+
+        const lastPost = await settingsCollection.findOne({ key: 'last_fsub_post' });
+        if (lastPost) LAST_FSUB_POST_ID = lastPost.value;
+
+        // Create indexes
+        await filesCollection.createIndex({ file_name: 'text' });
+        await usersCollection.createIndex({ user_id: 1 }, { unique: true });
+
+        // TTL Indexes for memory optimization (Auto-delete old data)
+        await trendingCollection.createIndex({ last_searched: 1 }, { expireAfterSeconds: 86400 * 7 }); // 7 days
+        await requestsCollection.createIndex({ last_requested: 1 }, { expireAfterSeconds: 86400 * 7 }); // 7 days
+
+        console.log('✅ Collection indexes & TTL created');
+    } catch (error) {
+        console.error('❌ MongoDB connection error:', error);
+        process.exit(1);
+    }
+}
+
+// Helper: Send log to log channel
+async function sendLog(message, parseMode = 'Markdown') {
+    if (!LOG_CHANNEL_ID) return;
+
+    try {
+        await bot.telegram.sendMessage(LOG_CHANNEL_ID, message, {
+            parse_mode: parseMode
+        });
+    } catch (error) {
+        console.error('Error sending log:', error.message);
+    }
+}
+
+// Helper: Check if user is admin
+function isAdmin(userId) {
+    return ADMIN_IDS.includes(userId);
+}
+
+// Helper: Get bot uptime
+function getUptime() {
+    const uptimeMs = Date.now() - BOT_START_TIME;
+    const days = Math.floor(uptimeMs / (1000 * 60 * 60 * 24));
+    const hours = Math.floor((uptimeMs % (1000 * 60 * 60 * 24)) / (1000 * 60 * 60));
+    const minutes = Math.floor((uptimeMs % (1000 * 60 * 60)) / (1000 * 60));
+    return `${days}d ${hours}h ${minutes}m`;
+}
+
+// Helper: Format file size
+function formatFileSize(bytes) {
+    if (bytes < 1024) return bytes + ' B';
+    if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(2) + ' KB';
+    if (bytes < 1024 * 1024 * 1024) return (bytes / (1024 * 1024)).toFixed(2) + ' MB';
+    return (bytes / (1024 * 1024 * 1024)).toFixed(2) + ' GB';
+}
+
+// Helper: Parse file name for language, year, and quality
+function parseFileName(fileName) {
+    const languages = ['English', 'Hindi', 'Tamil', 'Telugu', 'Malayalam', 'Kannada', 'Bengali', 'Marathi'];
+    const quality = ['480p', '720p', '1080p', '1440p', '2160p', '4K', 'HDR', 'CAM', 'HDTS', 'Web-DL', 'BluRay'];
+
+    const yearMatch = fileName.match(/\b(19\d{2}|20\d{2})\b/);
+    const qualityMatch = quality.find(q => fileName.toLowerCase().includes(q.toLowerCase()));
+
+    let detectedLanguage = null;
+    for (const lang of languages) {
+        if (fileName.toLowerCase().includes(lang.toLowerCase())) {
+            detectedLanguage = lang;
+            break;
+        }
+    }
+
+    return {
+        year: yearMatch ? yearMatch[1] : null,
+        language: detectedLanguage,
+        quality: qualityMatch || null
+    };
+}
+
+// Helper: Parse Telegram Post URL
+function parsePostUrl(url) {
+    if (!url) return null;
+    try {
+        const parts = url.split('/');
+        const messageId = parseInt(parts.pop());
+        let chatId = parts.pop();
+
+        if (chatId === 'c') {
+            // Private channel link format: https://t.me/c/12345/678
+            chatId = '-100' + parts.pop();
+        } else {
+            // Public channel link format: https://t.me/username/678
+            chatId = '@' + chatId;
+        }
+
+        return { chatId, messageId };
+    } catch (e) {
+        return null;
+    }
+}
+
+// Helper: Check if user is subscribed (Force Subscribe) with caching
+async function isSubscribed(userId) {
+    if (!FSUB_CHANNEL_ID) return true;
+
+    try {
+        const member = await bot.telegram.getChatMember(FSUB_CHANNEL_ID, userId);
+        const status = ['member', 'administrator', 'creator'].includes(member.status);
+        return status;
+    } catch (error) {
+        console.log(`Subscription check error for ${userId}:`, error.message);
+        return false;
+    }
+}
+
+// Helper: Get user premium status
+async function isPremium(userId) {
+    const user = await usersCollection.findOne({ user_id: userId });
+    return user ? !!user.isPremium : false;
+}
+
+// Helper: Check if user is banned or bot is in maintenance
+async function checkUser(ctx) {
+    if (isAdmin(ctx.from.id)) return true;
+
+    if (IS_MAINTENANCE) {
+        await ctx.reply('🚧 *Maintenance Mode*\n\nBot is currently undergoing maintenance. Please try again later.', { parse_mode: 'Markdown' });
+        return false;
+    }
+
+    const user = await usersCollection.findOne({ user_id: ctx.from.id });
+    if (user && user.isBanned) {
+        await ctx.reply('⛔ *Access Denied*\n\nYou have been banned from using this bot.', { parse_mode: 'Markdown' });
+        return false;
+    }
+
+    return true;
+}
+
+// Helper: Save user to database with referral tracking
+async function saveUser(user, referredBy = null) {
+    try {
+        const existingUser = await usersCollection.findOne({ user_id: user.id });
+
+        const updateDoc = {
+            $set: {
+                user_id: user.id,
+                first_name: user.first_name,
+                username: user.username,
+                last_seen: new Date()
+            }
+        };
+
+        if (!existingUser) {
+            updateDoc.$set.joined_at = new Date();
+            updateDoc.$set.referrals = 0;
+            if (referredBy && referredBy !== user.id) {
+                updateDoc.$set.referred_by = referredBy;
+                // Increment referral count for the referrer
+                await usersCollection.updateOne(
+                    { user_id: referredBy },
+                    { $inc: { referrals: 1 } }
+                );
+            }
+        }
+
+        await usersCollection.updateOne(
+            { user_id: user.id },
+            updateDoc,
+            { upsert: true }
+        );
+    } catch (error) {
+        console.error('Error saving user:', error);
+    }
+}
+
+// Helper: Check if keyword is blocked
+async function isKeywordBlocked(text) {
+    if (!text) return false;
+    const words = text.toLowerCase().split(/\s+/);
+    const blocked = await blockedKeywordsCollection.find({}).toArray();
+    const blockedWords = blocked.map(b => b.word.toLowerCase());
+    return words.some(word => blockedWords.includes(word));
+}
+
+// Helper: Track search query for trending
+async function trackSearch(query) {
+    if (!query || query.length < 3) return;
+    try {
+        await trendingCollection.updateOne(
+            { query: query.toLowerCase() },
+            { $inc: { count: 1 }, $set: { last_searched: new Date() } },
+            { upsert: true }
+        );
+    } catch (error) {
+        console.error('Error tracking search:', error);
+    }
+}
+
+// Helper: Get database stats
+async function getDatabaseStats() {
+    try {
+        const stats = await db.stats();
+        const fileCount = await filesCollection.countDocuments();
+        const userCount = await usersCollection.countDocuments();
+
+        return {
+            totalFiles: fileCount,
+            totalUsers: userCount,
+            sizeInMB: (stats.dataSize / (1024 * 1024)).toFixed(2),
+            storageSizeInMB: (stats.storageSize / (1024 * 1024)).toFixed(2)
+        };
+    } catch (error) {
+        console.error('Error getting database stats:', error);
+        return null;
+    }
+}
+
+// Search files in MongoDB with fuzzy matching
+async function searchFiles(query, page = 0, filters = {}) {
+    try {
+        const skip = page * RESULTS_PER_PAGE;
+
+        // Build query with filters
+        let searchQuery = {};
+
+        // Use regex for basic search
+        if (query) {
+            searchQuery.file_name = new RegExp(query, 'i');
+        }
+
+        // Add filters
+        if (filters.language) {
+            searchQuery.file_name = {
+                ...searchQuery.file_name,
+                $regex: new RegExp(filters.language, 'i')
+            };
+        }
+        if (filters.year) {
+            searchQuery.file_name = {
+                ...searchQuery.file_name,
+                $regex: new RegExp(filters.year, 'i')
+            };
+        }
+        if (filters.quality) {
+            searchQuery.file_name = {
+                ...searchQuery.file_name,
+                $regex: new RegExp(filters.quality, 'i')
+            };
+        }
+
+        const results = await filesCollection
+            .find(searchQuery)
+            .skip(skip)
+            .limit(RESULTS_PER_PAGE + 1)
+            .toArray();
+
+        const hasMore = results.length > RESULTS_PER_PAGE;
+        const files = hasMore ? results.slice(0, RESULTS_PER_PAGE) : results;
+
+        // If no results with regex, try fuzzy search
+        if (files.length === 0 && query && !filters.language && !filters.year) {
+            const allFiles = await filesCollection.find({}).limit(1000).toArray();
+            const fuse = new Fuse(allFiles, {
+                keys: ['file_name'],
+                threshold: 0.4,
+                includeScore: true
+            });
+
+            const fuzzyResults = fuse.search(query);
+            const fuzzyFiles = fuzzyResults.slice(skip, skip + RESULTS_PER_PAGE).map(r => r.item);
+
+            return {
+                files: fuzzyFiles,
+                hasNext: fuzzyResults.length > skip + RESULTS_PER_PAGE,
+                hasPrev: page > 0,
+                currentPage: page,
+                isFuzzy: true
+            };
+        }
+
+        const resultData = {
+            files,
+            hasNext: hasMore,
+            hasPrev: page > 0,
+            currentPage: page,
+            isFuzzy: false
+        };
+
+        if (query && page === 0 && !filters.language && !filters.year && !filters.quality) {
+            await trackSearch(query);
+        }
+
+        return resultData;
+    } catch (error) {
+        console.error('Search error:', error);
+        return { files: [], hasNext: false, hasPrev: false, currentPage: 0, isFuzzy: false };
+    }
+}
+
+// Generate inline keyboard for search results
+// Generate keyboard with shortlink support
+async function generateKeyboard(files, query, page, hasNext, hasPrev, userId = null) {
+    const buttons = [];
+
+    // Filter buttons (only on first page)
+    if (page === 0 && files.length > 0) {
+        const filterRow1 = [];
+        const filterRow2 = [];
+
+        // Language filter
+        filterRow1.push(Markup.button.callback('🌐 Language', `filter_lang_${query}`));
+        // Year filter
+        filterRow1.push(Markup.button.callback('📅 Year', `filter_year_${query}`));
+        // Quality filter
+        filterRow2.push(Markup.button.callback('✨ Quality', `filter_qual_${query}`));
+
+        buttons.push(filterRow1);
+        buttons.push(filterRow2);
+    }
+
+    // File buttons
+    for (const file of files) {
+        const qualityTag = file.quality ? ` [${file.quality}]` : '';
+        buttons.push([
+            Markup.button.url(`🎬 ${file.file_name}${qualityTag}`, `https://t.me/${bot.botInfo.username}?start=file_${file._id}`)
+        ]);
+    }
+
+    // Pagination buttons
+    const paginationRow = [];
+    if (hasPrev) {
+        paginationRow.push(
+            Markup.button.callback('⏪ Prev', `page_${query}_${page - 1}`)
+        );
+    }
+    if (hasNext) {
+        paginationRow.push(
+            Markup.button.callback('Next ⏩', `page_${query}_${page + 1}`)
+        );
+    }
+
+    if (paginationRow.length > 0) {
+        buttons.push(paginationRow);
+    }
+
+    // Request button if no results or just for fun
+    if (files.length === 0) {
+        buttons.push([Markup.button.callback('🆘 Request Movie', `req_${query}`)]);
+    }
+
+    return Markup.inlineKeyboard(buttons);
+}
+
+// Index file to MongoDB
+async function indexFile(fileData) {
+    try {
+        const { year, language, quality } = parseFileName(fileData.file_name);
+
+        const document = {
+            _id: fileData.file_id,
+            file_ref: fileData.file_unique_id,
+            file_name: fileData.file_name,
+            file_size: fileData.file_size,
+            file_type: 'document',
+            mime_type: fileData.mime_type,
+            caption: fileData.caption || '',
+            year: year,
+            language: language,
+            quality: quality,
+            indexed_at: new Date()
+        };
+
+        // Check if file already exists
+        const existing = await filesCollection.findOne({ _id: document._id });
+        if (existing) {
+            return { success: false, message: 'File already indexed', duplicate: true };
+        }
+
+        await filesCollection.insertOne(document);
+        return { success: true, message: 'File indexed successfully', duplicate: false };
+    } catch (error) {
+        console.error('Error indexing file:', error);
+        return { success: false, message: 'Error indexing file', duplicate: false };
+    }
+}
+
+// Batch index files from a channel
+async function batchIndexFromChannel(channelId, fromMessageId, ctx) {
+    let indexed = 0;
+    let duplicates = 0;
+    let errors = 0;
+
+    try {
+        // Start from the forwarded message and go backwards
+        let currentMessageId = fromMessageId;
+
+        for (let i = 0; i < 1000; i++) { // Limit to prevent infinite loop
+            try {
+                const message = await bot.telegram.forwardMessage(
+                    ctx.chat.id,
+                    channelId,
+                    currentMessageId
+                );
+
+                // Delete the forwarded message immediately
+                await bot.telegram.deleteMessage(ctx.chat.id, message.message_id);
+
+                if (message.document) {
+                    const result = await indexFile({
+                        file_id: message.document.file_id,
+                        file_unique_id: message.document.file_unique_id,
+                        file_name: message.document.file_name,
+                        file_size: message.document.file_size,
+                        mime_type: message.document.mime_type,
+                        caption: message.caption || ''
+                    });
+
+                    if (result.success) {
+                        indexed++;
+
+                        // Log each indexed file
+                        await sendLog(
+                            `📥 *File Indexed*\n\n` +
+                            `📁 *File:* ${message.document.file_name}\n` +
+                            `💾 *Size:* ${formatFileSize(message.document.file_size)}\n` +
+                            `🆔 *File ID:* \`${message.document.file_id}\`\n` +
+                            `📍 *From:* Channel ${channelId}\n` +
+                            `👤 *By:* ${ctx.from.first_name} (${ctx.from.id})`
+                        );
+                    } else if (result.duplicate) {
+                        duplicates++;
+                    }
+                }
+
+                currentMessageId--;
+
+                // Update progress every 10 files
+                if ((indexed + duplicates) % 10 === 0) {
+                    await ctx.telegram.editMessageText(
+                        ctx.chat.id,
+                        ctx.message.message_id + 1,
+                        null,
+                        `⏳ Indexing in progress...\n\n✅ Indexed: ${indexed}\n⚠️ Duplicates: ${duplicates}`
+                    ).catch(() => { });
+                }
+
+            } catch (error) {
+                // If we can't fetch the message, we've reached the beginning
+                if (error.response && error.response.error_code === 400) {
+                    break;
+                }
+                errors++;
+                currentMessageId--;
+            }
+        }
+
+        return { indexed, duplicates, errors };
+    } catch (error) {
+        console.error('Batch indexing error:', error);
+        return { indexed, duplicates, errors };
+    }
+}
+
+// ===== HANDLERS - ORDER MATTERS! =====
+
+// Handle /start command with deep link
+bot.command('me', async (ctx) => {
+    if (!await checkUser(ctx)) return;
+    const user = await usersCollection.findOne({ user_id: ctx.from.id });
+    if (!user) return;
+
+    const profileText = `👤 *Noir Premium Profile*
+    
+🆔 *UID:* \`${ctx.from.id}\`
+🎭 *Name:* ${ctx.from.first_name}
+💎 *Status:* ${user.isPremium ? '🌟 Premium' : 'Free User'}
+🤝 *Referrals:* \`${user.referrals || 0}\`
+📅 *Joined:* ${user.joined_at ? new Date(user.joined_at).toLocaleDateString() : 'N/A'}
+
+🚀 _Share your link to grow your rank!_`;
+
+    await ctx.reply(profileText, { parse_mode: 'Markdown' });
+});
+
+// Handle check_sub action
+bot.action('check_sub', async (ctx) => {
+    const subscribed = await isSubscribed(ctx.from.id);
+    if (subscribed) {
+        await ctx.answerCbQuery('✅ Thank you for joining!');
+        await ctx.editMessageText('🎉 *Thank you for joining!*\n\nYou can now search for movies directly or click /start to see the main menu.', { parse_mode: 'Markdown' });
+    } else {
+        await ctx.answerCbQuery('❌ You have not joined yet!', { show_alert: true });
+    }
+});
+
+bot.start(async (ctx) => {
+    if (!await checkUser(ctx)) return;
+    const startPayload = ctx.startPayload;
+
+    // Handle referral payload
+    let referredBy = null;
+    if (startPayload && startPayload.startsWith('ref_')) {
+        referredBy = parseInt(startPayload.replace('ref_', ''));
+    }
+
+    // Save user and log
+    await saveUser(ctx.from, referredBy);
+
+    // Check Force Subscribe
+    const subscribed = await isSubscribed(ctx.from.id);
+    if (!subscribed && FSUB_CHANNEL_ID) {
+        const keyboard = Markup.inlineKeyboard([
+            [Markup.button.url('📢 Join Channel', FSUB_LINK)],
+            [Markup.button.callback('✅ I Have Joined', 'check_sub')]
+        ]);
+
+        await ctx.reply(
+            `🍿 *Welcome to Noir Premium Filter*\n\n` +
+            `To keep our library free and fast, please join our sponsor channel first!`,
+            { parse_mode: 'Markdown', ...keyboard }
+        );
+        return;
+    }
+
+    // Check if it's a file request
+    if (startPayload && startPayload.startsWith('file_')) {
+        const fileId = startPayload.replace('file_', '');
+        await sendFile(ctx, fileId);
+        return;
+    } else {
+        // Enhanced welcome message
+        const welcomeText = `🎬 *Noir Premium Filter Bot* 🍿
+
+🚀 *The fastest way to find movies!*
+
+✨ *Features:*
+└ 🔍 AI Smart Search
+└ 🗣️ Multi-Language Support
+└ 💎 HD Quality Filters
+└ 🤝 Referral Program
+
+🔥 *Trending Right Now:*
+${await getTrendingText()}
+
+💡 *Just type a movie name below to start!*`;
+
+        const keyboard = Markup.inlineKeyboard([
+            [Markup.button.callback('🔥 Trending', 'show_trending')],
+            [Markup.button.callback('🤝 Refer & Earn', 'show_refer')],
+            [Markup.button.callback('📊 Stats', 'show_stats'), Markup.button.callback('❓ Help', 'show_help')]
+        ]);
+
+        await ctx.reply(welcomeText, {
+            parse_mode: 'Markdown',
+            ...keyboard
+        });
+    }
+});
+
+
+
+// Helper: Send file with auto-delete and CTA button
+async function sendFile(ctx, fileId) {
+    try {
+        const file = await filesCollection.findOne({ _id: fileId });
+        if (!file) {
+            await ctx.reply('❌ File not found or has been deleted.');
+            return;
+        }
+
+        // Automatic Monetization: Forward the most recent channel post
+        if (IS_GROWTH_LOCK && FSUB_CHANNEL_ID && LAST_FSUB_POST_ID) {
+            const userIsPremium = await isPremium(ctx.from.id);
+            if (!userIsPremium) {
+                try {
+                    const forwarded = await ctx.telegram.forwardMessage(ctx.from.id, FSUB_CHANNEL_ID, LAST_FSUB_POST_ID);
+                    // Single-use monetization post: Auto-delete after 5 minutes (300s)
+                    setTimeout(() => {
+                        ctx.telegram.deleteMessage(ctx.from.id, forwarded.message_id).catch(() => { });
+                    }, 300 * 1000);
+                } catch (e) {
+                    console.error('Error forwarding auto-monetization post:', e.message);
+                }
+            }
+        }
+
+        const keyboard = Markup.inlineKeyboard([
+            [Markup.button.url('🍿 Join Main Channel', FSUB_LINK)]
+        ]);
+
+        const sentMsg = await ctx.replyWithDocument(file._id, {
+            caption: `🎬 *${file.file_name}*\n\n` +
+                `📦 *Size:* ${formatFileSize(file.file_size)}\n` +
+                `✨ *Quality:* ${file.quality || 'N/A'}\n\n` +
+                `⚠️ _This file will auto-delete in ${AUTO_DELETE_SECONDS}s_`,
+            ...keyboard,
+            parse_mode: 'Markdown'
+        });
+
+        setTimeout(async () => {
+            try {
+                await ctx.telegram.deleteMessage(ctx.chat.id, sentMsg.message_id);
+                await ctx.reply(`❌ *File Deleted!* \n\nFiles are removed to keep our server fast. \n\n_Just search again if you missed it!_`, { parse_mode: 'Markdown' });
+            } catch (error) { }
+        }, AUTO_DELETE_SECONDS * 1000);
+    } catch (error) {
+        console.error('Error sending file:', error);
+    }
+}
+
+// Handle new group members (Auto-Welcome)
+bot.on('new_chat_members', async (ctx) => {
+    const chatTitle = ctx.chat.title;
+    const userNames = ctx.message.new_chat_members.map(m => m.first_name).join(', ');
+
+    const welcomeMsg = `🎬 *Welcome to ${chatTitle}!* 🍿\n\n` +
+        `Hello ${userNames}! 🥤\n\n` +
+        `🚀 *How to find movies?*\n` +
+        `Just type the movie name in this group or start me in PM!\n\n` +
+        `Powered by Noir Advanced Indexer`;
+
+    await ctx.reply(welcomeMsg, { parse_mode: 'Markdown' });
+});
+
+async function getTrendingText() {
+    try {
+        const trending = await trendingCollection.find({}).sort({ count: -1 }).limit(5).toArray();
+        if (trending.length === 0) return '_No trending yet_';
+        return trending.map((t, i) => `${i + 1}. \`${t.query}\``).join('\n');
+    } catch (error) {
+        return '_Error loading trending_';
+    }
+}
+
+// Handle /stats command (admin only)
+bot.command('stats', async (ctx) => {
+    if (!isAdmin(ctx.from.id)) {
+        await ctx.reply('⛔ This command is only available for admins.');
+        return;
+    }
+
+    const stats = await getDatabaseStats();
+    const uptime = getUptime();
+
+    if (stats) {
+        const statsText = `📊 *Bot Statistics*
+
+⏱️ *Uptime:* ${uptime}
+📁 *Total Files:* ${stats.totalFiles}
+💾 *Database Size:* ${stats.sizeInMB} MB
+🗄️ *Storage Size:* ${stats.storageSizeInMB} MB
+
+🤖 *Bot Info:*
+👤 Admin: ${ctx.from.first_name}
+🆔 User ID: ${ctx.from.id}`;
+
+        await ctx.reply(statsText, { parse_mode: 'Markdown' });
+    } else {
+        await ctx.reply('❌ Error fetching statistics.');
+    }
+});
+
+// Handle stats button callback
+bot.action('show_stats', async (ctx) => {
+    const stats = await getDatabaseStats();
+    const uptime = getUptime();
+
+    if (stats) {
+        const statsText = `📊 *Bot Statistics*
+
+⏱️ *Uptime:* ${uptime}
+📁 *Total Files:* ${stats.totalFiles}
+💾 *Database Size:* ${stats.sizeInMB} MB`;
+
+        await ctx.answerCbQuery();
+        await ctx.reply(statsText, { parse_mode: 'Markdown' });
+    } else {
+        await ctx.answerCbQuery('Error fetching stats');
+    }
+});
+
+// Handle referral button
+bot.action('show_refer', async (ctx) => {
+    const user = await usersCollection.findOne({ user_id: ctx.from.id });
+    const refLink = `https://t.me/${bot.botInfo.username}?start=ref_${ctx.from.id}`;
+    const refCount = user.referrals || 0;
+
+    const referText = `🤝 *Noir Referral Program*\n\n` +
+        `Invite your friends and grow our community! \n\n` +
+        `📈 *Your Stats:* \n` +
+        `└ Referred Users: \`${refCount}\` \n\n` +
+        `🔗 *Your Unique Link:* \n` +
+        `\`${refLink}\` \n\n` +
+        `_Copy and share this link to earn referrals!_`;
+
+    await ctx.answerCbQuery();
+    await ctx.reply(referText, { parse_mode: 'Markdown' });
+});
+
+// Handle request button action
+bot.action(/^req_(.+)$/, async (ctx) => {
+    const query = ctx.match[1];
+
+    // Save request
+    await requestsCollection.updateOne(
+        { query: query.toLowerCase() },
+        { $inc: { count: 1 }, $set: { last_requested: new Date() } },
+        { upsert: true }
+    );
+
+    await ctx.answerCbQuery('✅ Movie Requested!', { show_alert: true });
+    await ctx.editMessageText(`✅ *Requested:* \`${query}\`\n\nAdmins have been notified. We will add it soon!`, { parse_mode: 'Markdown' });
+
+    // Notify logs
+    await sendLog(
+        `🆘 *New Movie Request*\n\n` +
+        `🔍 *Query:* \`${query}\`\n` +
+        `👤 *User:* ${ctx.from.first_name} (${ctx.from.id})`
+    );
+});
+
+// Broadcast command (admin only)
+bot.command('broadcast', async (ctx) => {
+    if (!isAdmin(ctx.from.id)) return;
+
+    const message = ctx.message.reply_to_message;
+    if (!message) {
+        return ctx.reply('❌ Reply to a message to broadcast it.');
+    }
+
+    const m = await ctx.reply('⏳ Broadcasting message...');
+    const users = await usersCollection.find({}).toArray();
+    let success = 0;
+    let failed = 0;
+
+    for (const user of users) {
+        try {
+            await ctx.telegram.copyMessage(user.user_id, ctx.chat.id, message.message_id);
+            success++;
+        } catch (error) {
+            failed++;
+        }
+    }
+
+    await ctx.telegram.editMessageText(
+        ctx.chat.id,
+        m.message_id,
+        null,
+        `✅ *Broadcast Complete*\n\n` +
+        `👤 *Total Users:* ${users.length}\n` +
+        `✅ *Success:* ${success}\n` +
+        `❌ *Failed:* ${failed}`,
+        { parse_mode: 'Markdown' }
+    );
+});
+
+// Block Keyword
+bot.command('block', async (ctx) => {
+    if (!isAdmin(ctx.from.id)) return;
+    const word = ctx.message.text.split(' ')[1];
+    if (!word) return ctx.reply('Usage: /block <word>');
+    await blockedKeywordsCollection.updateOne({ word: word.toLowerCase() }, { $set: { word: word.toLowerCase() } }, { upsert: true });
+    await ctx.reply(`✅ *Blocked:* \`${word}\``, { parse_mode: 'Markdown' });
+});
+
+// Unblock Keyword
+bot.command('unblock', async (ctx) => {
+    if (!isAdmin(ctx.from.id)) return;
+    const word = ctx.message.text.split(' ')[1];
+    if (!word) return ctx.reply('Usage: /unblock <word>');
+    await blockedKeywordsCollection.deleteOne({ word: word.toLowerCase() });
+    await ctx.reply(`✅ *Unblocked:* \`${word}\``, { parse_mode: 'Markdown' });
+});
+
+// Set Premium
+bot.command('premium', async (ctx) => {
+    if (!isAdmin(ctx.from.id)) return;
+    const uid = parseInt(ctx.message.text.split(' ')[1]);
+    if (!uid) return ctx.reply('Usage: /premium <uid>');
+    await usersCollection.updateOne({ user_id: uid }, { $set: { isPremium: true } }, { upsert: true });
+    await ctx.reply(`🌟 *User ${uid} is now Premium!*`, { parse_mode: 'Markdown' });
+});
+
+// Remove Premium
+bot.command('unpremium', async (ctx) => {
+    if (!isAdmin(ctx.from.id)) return;
+    const uid = parseInt(ctx.message.text.split(' ')[1]);
+    if (!uid) return ctx.reply('Usage: /unpremium <uid>');
+    await usersCollection.updateOne({ user_id: uid }, { $set: { isPremium: false } }, { upsert: true });
+    await ctx.reply(`❌ *User ${uid} premium status removed.*`, { parse_mode: 'Markdown' });
+});
+
+// Admin Dashboard
+bot.command('admin', async (ctx) => {
+    if (!isAdmin(ctx.from.id)) return;
+
+    const stats = await getDatabaseStats();
+    const adminText = `🛠️ *Admin Dashboard*\n\n` +
+        `🚦 *Maintenance:* ${IS_MAINTENANCE ? '🔴 ON' : '🟢 OFF'}\n` +
+        `👁️ *Growth-Lock:* ${IS_VIEW_UNLOCK_ENABLED ? '🟢 ENABLED' : '🔴 DISABLED'}\n\n` +
+        `📊 *Total Stats:* \n` +
+        `└ Users: \`${stats.totalUsers}\` \n` +
+        `└ Files: \`${stats.totalFiles}\``;
+
+    const keyboard = Markup.inlineKeyboard([
+        [Markup.button.callback(IS_MAINTENANCE ? '🟢 Disable Mnt' : '🔴 Enable Mnt', 'toggle_mnt')],
+        [Markup.button.callback(IS_GROWTH_LOCK ? '🔴 Disable Lock' : '🟢 Enable Lock', 'toggle_gl')],
+        [Markup.button.callback('🔄 Refresh Stats', 'refresh_admin')]
+    ]);
+
+    await ctx.reply(adminText, { parse_mode: 'Markdown', ...keyboard });
+});
+
+bot.action('toggle_gl', async (ctx) => {
+    if (!isAdmin(ctx.from.id)) return;
+    IS_GROWTH_LOCK = !IS_GROWTH_LOCK;
+    await settingsCollection.updateOne({ key: 'growth_lock' }, { $set: { value: IS_GROWTH_LOCK } }, { upsert: true });
+    await ctx.answerCbQuery(`Monetization ${IS_GROWTH_LOCK ? 'Enabled' : 'Disabled'}`);
+    return triggerAdminRefresh(ctx);
+});
+
+// 🗑️ setpost command removed (Now Fully Automatic)
+
+// 🗑️ setpost command removed for simplicity
+
+bot.action('toggle_mnt', async (ctx) => {
+    if (!isAdmin(ctx.from.id)) return;
+    IS_MAINTENANCE = !IS_MAINTENANCE;
+    await settingsCollection.updateOne({ key: 'maintenance' }, { $set: { value: IS_MAINTENANCE } }, { upsert: true });
+    await ctx.answerCbQuery(`Maintenance ${IS_MAINTENANCE ? 'Enabled' : 'Disabled'}`);
+    // Refresh dashboard
+    return triggerAdminRefresh(ctx);
+});
+
+bot.action('refresh_admin', async (ctx) => {
+    if (!isAdmin(ctx.from.id)) return;
+    await ctx.answerCbQuery('Refreshed!');
+    return triggerAdminRefresh(ctx);
+});
+
+async function triggerAdminRefresh(ctx) {
+    const stats = await getDatabaseStats();
+    const adminText = `🛠️ *Admin Dashboard*\n\n` +
+        `🚦 *Maintenance:* ${IS_MAINTENANCE ? '🔴 ON' : '🟢 OFF'}\n` +
+        `👁️ *Monetization:* ${IS_GROWTH_LOCK ? '🟢 AUTO' : '🔴 DISABLED'}\n` +
+        `� *Tracking Channel:* \`${FSUB_CHANNEL_ID || 'Not Set'}\`\n` +
+        `📦 *Last Post ID:* \`${LAST_FSUB_POST_ID || 'Waiting...'}\`\n\n` +
+        `📊 *Total Stats:* \n` +
+        `└ Users: \`${stats.totalUsers}\` \n` +
+        `└ Files: \`${stats.totalFiles}\``;
+
+    const keyboard = Markup.inlineKeyboard([
+        [Markup.button.callback(IS_MAINTENANCE ? '🟢 Disable Mnt' : '🔴 Enable Mnt', 'toggle_mnt')],
+        [Markup.button.callback(IS_VIEW_UNLOCK_ENABLED ? '🔴 Disable Lock' : '🟢 Enable Lock', 'toggle_vu')],
+        [Markup.button.callback('🔄 Refresh Stats', 'refresh_admin')]
+    ]);
+
+    await ctx.editMessageText(adminText, { parse_mode: 'Markdown', ...keyboard }).catch(() => { });
+}
+
+// Handle trending action
+bot.action('show_trending', async (ctx) => {
+    const trendingText = await getTrendingText();
+    await ctx.answerCbQuery();
+    await ctx.reply(`🔥 *Trending Movies This Week:*\n\n${trendingText}\n\n_Type any of these to get them!_`, { parse_mode: 'Markdown' });
+});
+
+// Handle help button callback
+bot.action('show_help', async (ctx) => {
+    const helpText = `🎬 *Noir Premium Help Menu* 🍿
+
+*How to Search:*
+• Simply type the movie name (e.g., "Avengers")
+• Typos are okay! Our AI will find it.
+• Use the **✨ Quality** button to filter.
+
+*Referral Program:*
+• Invite friends using your link in the "Refer & Earn" section.
+• Top referrers get premium perks!
+
+*Request System:*
+• Not finding what you want? Click the **🆘 Request** button that appears!
+
+*Auto-Delete:*
+• Files sent in Private Chat auto-delete after ${AUTO_DELETE_SECONDS} seconds to protect our server.
+
+_Powered by Noir Advanced Indexer_`;
+
+    await ctx.answerCbQuery();
+    await ctx.reply(helpText, { parse_mode: 'Markdown' });
+});
+
+// Handle pagination callbacks
+bot.action(/^page_(.+)_(\d+)$/, async (ctx) => {
+    try {
+        const query = ctx.match[1];
+        const page = parseInt(ctx.match[2]);
+
+        const searchResult = await searchFiles(query, page);
+
+        if (searchResult.files.length === 0) {
+            await ctx.answerCbQuery('No more results');
+            return;
+        }
+
+        const keyboard = await generateKeyboard(
+            searchResult.files,
+            query,
+            page,
+            searchResult.hasNext,
+            searchResult.hasPrev,
+            ctx.from.id
+        );
+
+        const resultText = searchResult.isFuzzy
+            ? `🔍 Fuzzy results for "${query}"\nPage ${page + 1}`
+            : `🔍 Found results for "${query}"\nPage ${page + 1}`;
+
+        await ctx.editMessageText(resultText, keyboard);
+        await ctx.answerCbQuery();
+    } catch (error) {
+        console.error('Error handling pagination:', error);
+        await ctx.answerCbQuery('Error loading page');
+    }
+});
+
+// Handle filter callbacks
+bot.action(/^filter_(lang|year|qual)_(.+)$/, async (ctx) => {
+    const filterType = ctx.match[1];
+    const query = ctx.match[2];
+
+    // Extract unique items from search results
+    const searchResult = await searchFiles(query, 0);
+    const items = new Set();
+
+    searchResult.files.forEach(file => {
+        const parsed = parseFileName(file.file_name);
+        if (filterType === 'lang' && parsed.language) {
+            items.add(parsed.language);
+        } else if (filterType === 'year' && parsed.year) {
+            items.add(parsed.year);
+        } else if (filterType === 'qual' && parsed.quality) {
+            items.add(parsed.quality);
+        }
+    });
+
+    if (items.size === 0) {
+        const typeName = filterType === 'lang' ? 'languages' : (filterType === 'year' ? 'years' : 'qualities');
+        await ctx.answerCbQuery(`No ${typeName} found`);
+        return;
+    }
+
+    // Create filter buttons
+    const buttons = Array.from(items).map(item => [
+        Markup.button.callback(item, `apply_${filterType}_${item}_${query}`)
+    ]);
+
+    buttons.push([Markup.button.callback('« Back', `back_${query}`)]);
+
+    const title = filterType === 'lang' ? 'Language' : (filterType === 'year' ? 'Year' : 'Quality');
+    await ctx.editMessageText(
+        `Select ${title}:`,
+        Markup.inlineKeyboard(buttons)
+    );
+    await ctx.answerCbQuery();
+});
+
+// Handle apply filter callbacks
+bot.action(/^apply_(lang|year|qual)_(.+)_(.+)$/, async (ctx) => {
+    const filterType = ctx.match[1];
+    const filterValue = ctx.match[2];
+    const query = ctx.match[3];
+
+    let filters = {};
+    if (filterType === 'lang') filters.language = filterValue;
+    else if (filterType === 'year') filters.year = filterValue;
+    else if (filterType === 'qual') filters.quality = filterValue;
+
+    const searchResult = await searchFiles(query, 0, filters);
+
+    if (searchResult.files.length === 0) {
+        await ctx.answerCbQuery('No results with this filter');
+        return;
+    }
+
+    const keyboard = await generateKeyboard(
+        searchResult.files,
+        query,
+        0,
+        searchResult.hasNext,
+        searchResult.hasPrev,
+        ctx.from.id
+    );
+
+    const typeTitle = filterType === 'lang' ? 'Language' : (filterType === 'year' ? 'Year' : 'Quality');
+    await ctx.editMessageText(
+        `🔍 Results for "${query}" (${typeTitle}: ${filterValue})`,
+        keyboard
+    );
+    await ctx.answerCbQuery();
+});
+
+// Handle back button
+bot.action(/^back_(.+)$/, async (ctx) => {
+    const query = ctx.match[1];
+    const searchResult = await searchFiles(query, 0);
+
+    const keyboard = await generateKeyboard(
+        searchResult.files,
+        query,
+        0,
+        searchResult.hasNext,
+        searchResult.hasPrev,
+        ctx.from.id
+    );
+
+    await ctx.editMessageText(
+        `🔍 Found results for "${query}"\nPage 1`,
+        keyboard
+    );
+    await ctx.answerCbQuery();
+});
+
+// Handle indexing confirmation
+bot.action(/^confirm_index_(.+)_(.+)$/, async (ctx) => {
+    const channelId = parseInt(ctx.match[1]);
+    const messageId = parseInt(ctx.match[2]);
+
+    await ctx.answerCbQuery('Starting indexing...');
+    await ctx.editMessageText('⏳ Starting batch indexing...\n\nThis may take a while. Please wait...');
+
+    // Log indexing start
+    await sendLog(
+        `🚀 *Batch Indexing Started*\n\n` +
+        `📍 *Channel ID:* ${channelId}\n` +
+        `📨 *From Message:* ${messageId}\n` +
+        `👤 *Admin:* ${ctx.from.first_name} (${ctx.from.id})\n` +
+        `⏰ *Started:* ${new Date().toLocaleString()}`
+    );
+
+    const result = await batchIndexFromChannel(channelId, messageId, ctx);
+
+    const summaryText = `✅ *Indexing Complete!*\n\n` +
+        `📥 *Indexed:* ${result.indexed} files\n` +
+        `⚠️ *Duplicates:* ${result.duplicates}\n` +
+        `❌ *Errors:* ${result.errors}`;
+
+    await ctx.editMessageText(summaryText, { parse_mode: 'Markdown' });
+
+    // Log indexing completion
+    await sendLog(
+        `✅ *Batch Indexing Completed*\n\n` +
+        `📥 *Indexed:* ${result.indexed} files\n` +
+        `⚠️ *Duplicates:* ${result.duplicates}\n` +
+        `❌ *Errors:* ${result.errors}\n` +
+        `👤 *Admin:* ${ctx.from.first_name} (${ctx.from.id})\n` +
+        `⏰ *Completed:* ${new Date().toLocaleString()}`
+    );
+});
+
+// Handle indexing cancellation
+bot.action(/^cancel_index$/, async (ctx) => {
+    await ctx.answerCbQuery('Indexing cancelled');
+    await ctx.editMessageText('❌ Indexing cancelled.');
+});
+
+// Handle forwarded messages from channels (admin only)
+bot.on('forward_from_chat', async (ctx) => {
+    if (!isAdmin(ctx.from.id)) return;
+
+    const forwardedFrom = ctx.message.forward_from_chat;
+
+    if (forwardedFrom.type === 'channel') {
+        const channelId = forwardedFrom.id;
+        const messageId = ctx.message.forward_from_message_id;
+
+        const keyboard = Markup.inlineKeyboard([
+            [
+                Markup.button.callback('✅ Index', `confirm_index_${channelId}_${messageId}`),
+                Markup.button.callback('❌ Cancel', 'cancel_index')
+            ]
+        ]);
+
+        await ctx.reply(
+            `📋 *Batch Indexing Confirmation*\n\n` +
+            `📍 *Channel:* ${forwardedFrom.title}\n` +
+            `🆔 *Channel ID:* \`${channelId}\`\n` +
+            `📨 *From Message ID:* ${messageId}\n\n` +
+            `⚠️ This will index all files from this message backwards.\n\n` +
+            `Do you want to proceed?`,
+            { parse_mode: 'Markdown', ...keyboard }
+        );
+    }
+});
+
+// Handle all channel posts (for monetization tracking and indexing)
+bot.on('channel_post', async (ctx) => {
+    const message = ctx.channelPost;
+    const chatId = ctx.chat.id;
+
+    // 1. Monetization: Track the latest post from Force-Sub Channel
+    if (FSUB_CHANNEL_ID && chatId === FSUB_CHANNEL_ID) {
+        LAST_FSUB_POST_ID = message.message_id;
+        await settingsCollection.updateOne({ key: 'last_fsub_post' }, { $set: { value: LAST_FSUB_POST_ID } }, { upsert: true });
+        console.log(`📈 Monetization updated: Last post ID ${LAST_FSUB_POST_ID} from FSUB channel`);
+    }
+
+    // 2. Auto-indexing from Database Channel
+    if (DATABASE_CHANNEL_ID && chatId === DATABASE_CHANNEL_ID && message.document) {
+        const document = message.document;
+        const result = await indexFile({
+            file_id: document.file_id,
+            file_unique_id: document.file_unique_id,
+            file_name: document.file_name,
+            file_size: document.file_size,
+            mime_type: document.mime_type,
+            caption: message.caption || ''
+        });
+
+        if (result.success) {
+            console.log(`📥 Auto-indexed from channel: ${document.file_name}`);
+            await sendLog(
+                `📥 *Auto-Indexed from Database Channel*\n\n` +
+                `📁 *File Name:* \`${document.file_name}\`\n` +
+                `💾 *File Size:* ${formatFileSize(document.file_size)}\n` +
+                `🆔 *File ID:* \`${document.file_id}\`\n` +
+                `✨ *Status:* Success`
+            );
+        }
+    }
+});
+
+// Handle document messages from Admin (Manual Indexing)
+bot.on('document', async (ctx) => {
+    if (ctx.chat.type === 'private' && isAdmin(ctx.from.id)) {
+        const document = ctx.message.document;
+        const result = await indexFile({
+            file_id: document.file_id,
+            file_unique_id: document.file_unique_id,
+            file_name: document.file_name,
+            file_size: document.file_size,
+            mime_type: document.mime_type,
+            caption: ctx.message.caption || ''
+        });
+
+        if (result.success) {
+            await ctx.reply(`✅ ${result.message}\n📁 ${document.file_name}`);
+            await sendLog(
+                `📥 *Manual File Indexed*\n\n` +
+                `📁 *File:* ${document.file_name}\n` +
+                `💾 *Size:* ${formatFileSize(document.file_size)}\n` +
+                `👤 *Admin:* ${ctx.from.first_name} (${ctx.from.id})`
+            );
+        } else {
+            await ctx.reply(`⚠️ ${result.message}`);
+        }
+    }
+});
+
+
+// Handle bot added to group
+bot.on('my_chat_member', async (ctx) => {
+    const update = ctx.myChatMember;
+    const oldStatus = update.old_chat_member.status;
+    const newStatus = update.new_chat_member.status;
+
+    // Bot was added to a group/channel
+    if ((oldStatus === 'left' || oldStatus === 'kicked') &&
+        (newStatus === 'member' || newStatus === 'administrator')) {
+
+        const chat = update.chat;
+        const isAdmin = newStatus === 'administrator';
+
+        await sendLog(
+            `➕ *Bot Added to ${chat.type === 'channel' ? 'Channel' : 'Group'}*\n\n` +
+            `📍 *Name:* ${chat.title}\n` +
+            `🆔 *Chat ID:* \`${chat.id}\`\n` +
+            `👤 *Added by:* ${ctx.from.first_name} (${ctx.from.id})\n` +
+            `👑 *Admin Rights:* ${isAdmin ? '✅ Yes' : '❌ No'}\n` +
+            `⏰ *Time:* ${new Date().toLocaleString()}`
+        );
+    }
+});
+
+// Handle keyword search in groups and PMs
+bot.on('text', async (ctx) => {
+    if (!await checkUser(ctx)) return;
+    const message = ctx.message.text.trim();
+
+    // Group Anti-Link: Delete links from non-admins
+    if (ctx.chat.type !== 'private') {
+        const linkRegex = /https?:\/\/[^\s]+|www\.[^\s]+|t\.me\/[^\s]+/i;
+        if (linkRegex.test(message)) {
+            const member = await ctx.getChatMember(ctx.from.id);
+            if (!['administrator', 'creator'].includes(member.status)) {
+                try {
+                    await ctx.deleteMessage();
+                    return; // Don't process the message further
+                } catch (e) { }
+            }
+        }
+    }
+
+    // Keyword Blocking
+    if (await isKeywordBlocked(message)) {
+        if (ctx.chat.type === 'private') {
+            await ctx.reply('⚠️ *Search restricted:* This keyword is blocked due to safety policies.', { parse_mode: 'Markdown' });
+        }
+        return;
+    }
+
+    // Ignore commands
+    if (message.startsWith('/')) {
+        return;
+    }
+
+    // Check Force Subscribe
+    const subscribed = await isSubscribed(ctx.from.id);
+    if (!subscribed && FSUB_CHANNEL_ID) {
+        const keyboard = Markup.inlineKeyboard([
+            [Markup.button.url('📢 Join Channel', FSUB_LINK)],
+            [Markup.button.callback('✅ I Have Joined', 'check_sub')]
+        ]);
+
+        await ctx.reply(
+            `❌ *Access Denied!*\n\n` +
+            `You must join our channel to use this bot.\n\n` +
+            `Please join and click the button below:`,
+            { parse_mode: 'Markdown', ...keyboard }
+        );
+        return;
+    }
+
+    // Ignore empty messages
+    if (message.length === 0) {
+        return;
+    }
+
+    try {
+        const searchResult = await searchFiles(message, 0);
+
+        if (searchResult.files.length === 0) {
+            // Only reply to failed searches in PM, or if it's explicitly a command-like text in groups
+            if (ctx.chat.type === 'private' || message.includes('movie') || message.includes('film')) {
+                await ctx.reply(`❌ No results found for "${message}"\n\n💡 Try different keywords or check spelling`,
+                    await generateKeyboard([], message, 0, false, false, ctx.from.id));
+            }
+            return;
+        }
+
+        // In groups, if it's just a regular message, show a "Found Results" button instead of full list to save space
+        if (ctx.chat.type !== 'private' && message.length < 20) {
+            const keyboard = Markup.inlineKeyboard([
+                [Markup.button.callback(`🔍 Click to view results (${searchResult.files.length})`, `page_${message}_0`)]
+            ]);
+            const sentMsg = await ctx.reply(`🎬 I found some movies for "${message}"`, keyboard);
+
+            // Auto-delete after 5 minutes (300s) to keep group clean
+            setTimeout(() => ctx.telegram.deleteMessage(ctx.chat.id, sentMsg.message_id).catch(() => { }), 300 * 1000);
+            return;
+        }
+
+        const keyboard = await generateKeyboard(
+            searchResult.files,
+            message,
+            0,
+            searchResult.hasNext,
+            searchResult.hasPrev,
+            ctx.from.id
+        );
+
+        const resultText = searchResult.isFuzzy
+            ? `🔍 *Fuzzy results for* "${message}"\nPage 1\n\n💡 _Showing closest matches_`
+            : `🔍 *Found results for* "${message}"\nPage 1`;
+
+        const sentMsg = await ctx.reply(resultText, { parse_mode: 'Markdown', ...keyboard });
+
+        // Group Auto-Cleaner: Delete search result in groups after 60 seconds
+        if (ctx.chat.type !== 'private') {
+            setTimeout(async () => {
+                try {
+                    await ctx.telegram.deleteMessage(ctx.chat.id, sentMsg.message_id);
+                    await ctx.telegram.deleteMessage(ctx.chat.id, ctx.message.message_id); // Delete user's query too
+                } catch (error) { }
+            }, 300 * 1000);
+        }
+    } catch (error) {
+        console.error('Error handling search:', error);
+        await ctx.reply('❌ An error occurred while searching. Please try again.');
+    }
+});
+
+// Handle errors
+bot.catch((err, ctx) => {
+    console.error('Bot error:', err);
+});
+
+// Start the bot
+async function startBot() {
+    await connectDB();
+
+    // Get bot info
+    const botInfo = await bot.telegram.getMe();
+    bot.botInfo = botInfo;
+    console.log(`✅ Bot username: @${botInfo.username}`);
+
+    if (ADMIN_IDS.length > 0) {
+        console.log(`✅ Admin IDs configured: ${ADMIN_IDS.join(', ')}`);
+    }
+
+    if (DATABASE_CHANNEL_ID) {
+        console.log(`✅ Auto-indexing enabled from channel: ${DATABASE_CHANNEL_ID}`);
+    }
+
+    if (LOG_CHANNEL_ID) {
+        console.log(`✅ Logging enabled to channel: ${LOG_CHANNEL_ID}`);
+
+        // Send bot startup log
+        await sendLog(
+            `🚀 *Bot Started*\n\n` +
+            `🤖 *Bot:* @${botInfo.username}\n` +
+            `⏰ *Time:* ${new Date().toLocaleString()}\n` +
+            `📊 *Version:* 2.0 (Advanced Features)`
+        );
+    }
+
+    await bot.launch();
+    console.log('✅ Bot is running with all advanced features...');
+    console.log(`⏱️  Auto-delete timer: ${AUTO_DELETE_SECONDS} seconds`);
+
+    // Simple HTTP server for health checks (required by some hosting providers)
+    const http = require('http');
+    const port = process.env.PORT || 8080;
+    http.createServer((req, res) => {
+        res.writeHead(200, { 'Content-Type': 'text/plain' });
+        res.end('Bot is running!');
+    }).listen(port);
+    console.log(`📡 Health check server listening on port ${port}`);
+
+    // Self-pinging utility to keep the bot alive (similar to your Python script)
+    const APP_URL = process.env.APP_URL; // e.g., https://your-app-name.koyeb.app/
+    if (APP_URL) {
+        const https = require('https');
+        console.log(`🚀 Self-ping enabled for: ${APP_URL}`);
+        setInterval(() => {
+            https.get(APP_URL, (res) => {
+                console.log(`📡 Self-ping status: ${res.statusCode}`);
+            }).on('error', (err) => {
+                console.error('❌ Self-ping error:', err.message);
+            });
+        }, 90 * 1000); // Ping every 90 seconds
+    }
+
+    // Enable graceful stop
+    process.once('SIGINT', () => bot.stop('SIGINT'));
+    process.once('SIGTERM', () => bot.stop('SIGTERM'));
+}
+
+startBot();
