@@ -100,6 +100,17 @@ async function connectDB() {
         // Create indexes
         await filesCollection.createIndex({ file_name: 'text' });
 
+        // Migration: Rename 'language' to 'file_lang' for existing documents (MongoDB Conflict Fix)
+        const oldDocs = await filesCollection.findOne({ language: { $exists: true } });
+        if (oldDocs) {
+            console.log('🔄 MongoDB Migration: Renaming "language" field to "file_lang"...');
+            await filesCollection.updateMany(
+                { language: { $exists: true } },
+                { $rename: { language: 'file_lang' } }
+            );
+            console.log('✅ Migration complete: Global language override conflict resolved.');
+        }
+
         // Fix: Remove documents with null user_id before creating unique index
         await usersCollection.deleteMany({ user_id: null });
         await usersCollection.createIndex({ user_id: 1 }, { unique: true });
@@ -168,7 +179,7 @@ function parseFileName(fileName) {
 
     return {
         year: yearMatch ? yearMatch[1] : null,
-        language: detectedLanguage,
+        file_lang: detectedLanguage,
         quality: qualityMatch || null
     };
 }
@@ -327,8 +338,8 @@ async function searchFiles(query, page = 0, filters = {}) {
         }
 
         // Add filters (now additive)
-        if (filters.language) {
-            conditions.push({ file_name: { $regex: new RegExp(filters.language, 'i') } });
+        if (filters.file_lang) {
+            conditions.push({ file_name: { $regex: new RegExp(filters.file_lang, 'i') } });
         }
         if (filters.year) {
             conditions.push({ file_name: { $regex: new RegExp(filters.year, 'i') } });
@@ -353,7 +364,7 @@ async function searchFiles(query, page = 0, filters = {}) {
         const files = hasMore ? results.slice(0, RESULTS_PER_PAGE) : results;
 
         // If no results with regex, try fuzzy search
-        if (files.length === 0 && query && !filters.language && !filters.year) {
+        if (files.length === 0 && query && !filters.file_lang && !filters.year) {
             const allFiles = await filesCollection.find({}).limit(1000).toArray();
             const fuse = new Fuse(allFiles, {
                 keys: ['file_name'],
@@ -381,7 +392,7 @@ async function searchFiles(query, page = 0, filters = {}) {
             isFuzzy: false
         };
 
-        if (query && page === 0 && !filters.language && !filters.year && !filters.quality) {
+        if (query && page === 0 && !filters.file_lang && !filters.year && !filters.quality) {
             await trackSearch(query);
         }
 
@@ -448,7 +459,7 @@ async function indexFile(fileData) {
     try {
         // Fallback for missing file names (common in videos)
         const fileName = fileData.file_name || fileData.caption || 'Untitled Media';
-        const { year, language, quality } = parseFileName(fileName);
+        const { year, file_lang, quality } = parseFileName(fileName);
 
         const document = {
             _id: fileData.file_id,
@@ -459,7 +470,7 @@ async function indexFile(fileData) {
             mime_type: fileData.mime_type,
             caption: fileData.caption || '',
             year: year,
-            language: language,
+            file_lang: file_lang,
             quality: quality,
             indexed_at: new Date()
         };
@@ -1100,7 +1111,7 @@ bot.action(/^filter_(lang|year|qual)_(.+)$/, async (ctx) => {
     if (filterType === 'lang') {
         searchResult.files.forEach(file => {
             const parsed = parseFileName(file.file_name);
-            if (parsed.language) items.add(parsed.language);
+            if (parsed.file_lang) items.add(parsed.file_lang);
         });
     } else if (filterType === 'year') {
         ['2025', '2024', '2023', '2022', '2021', '2020'].forEach(year => items.add(year));
@@ -1142,7 +1153,7 @@ bot.action(/^apply_(lang|year|qual)_(.+)_(.+)$/, async (ctx) => {
     const query = ctx.match[3];
 
     let filters = {};
-    if (filterType === 'lang') filters.language = filterValue;
+    if (filterType === 'lang') filters.file_lang = filterValue;
     else if (filterType === 'year') filters.year = filterValue;
     else if (filterType === 'qual') filters.quality = filterValue;
 
