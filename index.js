@@ -446,14 +446,16 @@ async function generateKeyboard(files, query, page, hasNext, hasPrev, userId = n
 // Index file to MongoDB
 async function indexFile(fileData) {
     try {
-        const { year, language, quality } = parseFileName(fileData.file_name);
+        // Fallback for missing file names (common in videos)
+        const fileName = fileData.file_name || fileData.caption || 'Untitled Media';
+        const { year, language, quality } = parseFileName(fileName);
 
         const document = {
             _id: fileData.file_id,
             file_ref: fileData.file_unique_id,
-            file_name: fileData.file_name,
+            file_name: fileName,
             file_size: fileData.file_size,
-            file_type: 'document',
+            file_type: fileData.file_type || 'document',
             mime_type: fileData.mime_type,
             caption: fileData.caption || '',
             year: year,
@@ -497,13 +499,17 @@ async function batchIndexFromChannel(channelId, fromMessageId, ctx) {
                 // Delete the forwarded message immediately
                 await bot.telegram.deleteMessage(ctx.chat.id, message.message_id);
 
-                if (message.document) {
+                const media = message.document || message.video || message.audio;
+                const type = message.document ? 'document' : (message.video ? 'video' : 'audio');
+
+                if (media) {
                     const result = await indexFile({
-                        file_id: message.document.file_id,
-                        file_unique_id: message.document.file_unique_id,
-                        file_name: message.document.file_name,
-                        file_size: message.document.file_size,
-                        mime_type: message.document.mime_type,
+                        file_id: media.file_id,
+                        file_unique_id: media.file_unique_id,
+                        file_name: media.file_name,
+                        file_size: media.file_size,
+                        mime_type: media.mime_type,
+                        file_type: type,
                         caption: message.caption || ''
                     });
 
@@ -513,11 +519,10 @@ async function batchIndexFromChannel(channelId, fromMessageId, ctx) {
                         // Log each indexed file
                         await sendLog(
                             `📥 *File Indexed*\n\n` +
-                            `📁 *File:* ${message.document.file_name}\n` +
-                            `💾 *Size:* ${formatFileSize(message.document.file_size)}\n` +
-                            `🆔 *File ID:* \`${message.document.file_id}\`\n` +
-                            `📍 *From:* Channel ${channelId}\n` +
-                            `👤 *By:* ${ctx.from.first_name} (${ctx.from.id})`
+                            `📁 *File:* ${media.file_name || message.caption || 'Untitled'}\n` +
+                            `💾 *Size:* ${formatFileSize(media.file_size)}\n` +
+                            `🆔 *Type:* ${type}\n` +
+                            `📍 *From:* Channel ${channelId}`
                         );
                     } else if (result.duplicate) {
                         duplicates++;
@@ -698,15 +703,19 @@ async function sendFile(ctx, fileId) {
         ]);
 
         const deleteInMins = Math.floor(AUTO_DELETE_SECONDS / 60);
+        const caption = `🎬 *${file.file_name}*\n\n` +
+            `📦 *Size:* ${formatFileSize(file.file_size)}\n` +
+            `✨ *Quality:* ${file.quality || 'N/A'}\n\n` +
+            `⚠️ _This file will auto-delete in ${deleteInMins} minutes_`;
 
-        const sentMsg = await ctx.replyWithDocument(file._id, {
-            caption: `🎬 *${file.file_name}*\n\n` +
-                `📦 *Size:* ${formatFileSize(file.file_size)}\n` +
-                `✨ *Quality:* ${file.quality || 'N/A'}\n\n` +
-                `⚠️ _This file will auto-delete in ${deleteInMins} minutes_`,
-            ...keyboard,
-            parse_mode: 'Markdown'
-        });
+        let sentMsg;
+        if (file.file_type === 'video') {
+            sentMsg = await ctx.replyWithVideo(file._id, { caption, ...keyboard, parse_mode: 'Markdown' });
+        } else if (file.file_type === 'audio') {
+            sentMsg = await ctx.replyWithAudio(file._id, { caption, ...keyboard, parse_mode: 'Markdown' });
+        } else {
+            sentMsg = await ctx.replyWithDocument(file._id, { caption, ...keyboard, parse_mode: 'Markdown' });
+        }
 
         setTimeout(async () => {
             try {
@@ -1310,6 +1319,8 @@ bot.on('channel_post', async (ctx) => {
     const message = ctx.channelPost;
     const chatId = ctx.chat.id;
 
+    console.log(`📡 Channel post received from ID: ${chatId}`);
+
     // 1. Monetization: Track the latest post from Force-Sub Channel
     if (FSUB_CHANNEL_ID && chatId === FSUB_CHANNEL_ID) {
         LAST_FSUB_POST_ID = message.message_id;
@@ -1318,56 +1329,69 @@ bot.on('channel_post', async (ctx) => {
     }
 
     // 2. Auto-indexing from Database Channel
-    if (DATABASE_CHANNEL_ID && chatId === DATABASE_CHANNEL_ID && message.document) {
-        const document = message.document;
-        const result = await indexFile({
-            file_id: document.file_id,
-            file_unique_id: document.file_unique_id,
-            file_name: document.file_name,
-            file_size: document.file_size,
-            mime_type: document.mime_type,
-            caption: message.caption || ''
-        });
+    if (DATABASE_CHANNEL_ID && chatId === DATABASE_CHANNEL_ID) {
+        const media = message.document || message.video || message.audio;
+        const type = message.document ? 'document' : (message.video ? 'video' : 'audio');
 
-        if (result.success) {
-            console.log(`📥 Auto-indexed from channel: ${document.file_name}`);
-            await sendLog(
-                `📥 *Auto-Indexed from Database Channel*\n\n` +
-                `📁 *File Name:* \`${document.file_name}\`\n` +
-                `💾 *File Size:* ${formatFileSize(document.file_size)}\n` +
-                `🆔 *File ID:* \`${document.file_id}\`\n` +
-                `✨ *Status:* Success`
-            );
+        console.log(`📂 DB Channel activity detected. Type: ${media ? type : 'none'}`);
+
+        if (media) {
+            const result = await indexFile({
+                file_id: media.file_id,
+                file_unique_id: media.file_unique_id,
+                file_name: media.file_name,
+                file_size: media.file_size,
+                mime_type: media.mime_type,
+                file_type: type,
+                caption: message.caption || ''
+            });
+
+            if (result.success) {
+                console.log(`📥 Auto-indexed from channel: ${media.file_name || 'Media'}`);
+                await sendLog(
+                    `📥 *Auto-Indexed from Database Channel*\n\n` +
+                    `📁 *Name:* \`${media.file_name || message.caption || 'Untitled'}\`\n` +
+                    `💾 *Size:* ${formatFileSize(media.file_size)}\n` +
+                    `🆔 *Type:* ${type}\n` +
+                    `✨ *Status:* Success`
+                );
+            } else {
+                console.log(`⚠️ Indexing failed: ${result.message}`);
+            }
         }
     }
 });
 
-// Handle document messages from Admin (Manual Indexing)
-bot.on('document', async (ctx) => {
+// Handle document/media messages from Admin (Manual Indexing)
+bot.on(['document', 'video', 'audio'], async (ctx) => {
     if (ctx.chat.type === 'private' && isAdmin(ctx.from.id)) {
-        const document = ctx.message.document;
+        const media = ctx.message.document || ctx.message.video || ctx.message.audio;
+        const type = ctx.message.document ? 'document' : (ctx.message.video ? 'video' : 'audio');
+
         const result = await indexFile({
-            file_id: document.file_id,
-            file_unique_id: document.file_unique_id,
-            file_name: document.file_name,
-            file_size: document.file_size,
-            mime_type: document.mime_type,
+            file_id: media.file_id,
+            file_unique_id: media.file_unique_id,
+            file_name: media.file_name,
+            file_size: media.file_size,
+            mime_type: media.mime_type,
+            file_type: type,
             caption: ctx.message.caption || ''
         });
 
         if (result.success) {
-            await ctx.reply(`✅ ${result.message}\n📁 ${document.file_name}`);
+            await ctx.reply(`✅ Indexed Successfully!\n📁 ${media.file_name || ctx.message.caption || 'Untitled'}\n🆔 Type: ${type}`);
             await sendLog(
-                `📥 *Manual File Indexed*\n\n` +
-                `📁 *File:* ${document.file_name}\n` +
-                `💾 *Size:* ${formatFileSize(document.file_size)}\n` +
+                `📥 *Manual Media Indexed*\n\n` +
+                `📁 *Name:* ${media.file_name || ctx.message.caption || 'Untitled'}\n` +
+                `💾 *Size:* ${formatFileSize(media.file_size)}\n` +
+                `🆔 *Type:* ${type}\n` +
                 `👤 *Admin:* ${ctx.from.first_name} (${ctx.from.id})`
             );
         } else if (result.duplicate) {
             const keyboard = Markup.inlineKeyboard([
-                [Markup.button.callback('🗑️ Delete from DB', `delete_confirm_${document.file_id}`)]
+                [Markup.button.callback('🗑️ Delete from DB', `delete_confirm_${media.file_id}`)]
             ]);
-            await ctx.reply(`⚠️ *File already indexed:*\n📁 ${document.file_name}\n\nDo you want to remove it?`, { parse_mode: 'Markdown', ...keyboard });
+            await ctx.reply(`⚠️ *Media already indexed:*\n📁 ${media.file_name || ctx.message.caption || 'Untitled'}\n\nDo you want to remove it?`, { parse_mode: 'Markdown', ...keyboard });
         } else {
             await ctx.reply(`⚠️ ${result.message}`);
         }
