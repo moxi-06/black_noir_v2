@@ -18,6 +18,8 @@ const FSUB_LINK = process.env.FSUB_LINK || '';
 let IS_MAINTENANCE = process.env.IS_MAINTENANCE === 'true';
 let IS_GROWTH_LOCK = process.env.IS_GROWTH_LOCK === 'true';
 let LAST_FSUB_POST_ID = null;
+let LAST_PING_STATUS = 'Waiting...';
+let LAST_PING_TIME = null;
 
 const RESULTS_PER_PAGE = 10;
 const AUTO_DELETE_SECONDS = 3600;
@@ -677,17 +679,21 @@ async function sendFile(ctx, fileId) {
                     console.error('Error forwarding auto-monetization post:', e.message);
                 }
             }
+        } else if (IS_GROWTH_LOCK) {
+            console.log(`📡 Monetization skipped: FSUB_ID=${!!FSUB_CHANNEL_ID}, POST_ID=${!!LAST_FSUB_POST_ID}`);
         }
 
         const keyboard = Markup.inlineKeyboard([
             [Markup.button.url('🍿 Join Main Channel', FSUB_LINK)]
         ]);
 
+        const deleteInMins = Math.floor(AUTO_DELETE_SECONDS / 60);
+
         const sentMsg = await ctx.replyWithDocument(file._id, {
             caption: `🎬 *${file.file_name}*\n\n` +
                 `📦 *Size:* ${formatFileSize(file.file_size)}\n` +
                 `✨ *Quality:* ${file.quality || 'N/A'}\n\n` +
-                `⚠️ _This file will auto-delete in ${AUTO_DELETE_SECONDS}s_`,
+                `⚠️ _This file will auto-delete in ${deleteInMins} minutes_`,
             ...keyboard,
             parse_mode: 'Markdown'
         });
@@ -934,16 +940,20 @@ bot.command('admin', async (ctx) => {
     if (!isAdmin(ctx.from.id)) return;
 
     const stats = await getDatabaseStats();
-    const adminText = `🛠️ *Admin Dashboard*\n\n` +
-        `🚦 *Maintenance:* ${IS_MAINTENANCE ? '🔴 ON' : '🟢 OFF'}\n` +
-        `👁️ *Growth-Lock:* ${IS_VIEW_UNLOCK_ENABLED ? '🟢 ENABLED' : '🔴 DISABLED'}\n\n` +
-        `📊 *Total Stats:* \n` +
-        `└ Users: \`${stats.totalUsers}\` \n` +
-        `└ Files: \`${stats.totalFiles}\``;
+    const adminText = `🛠️ *Admin Dashboard*
+
+🚦 *Maintenance:* ${IS_MAINTENANCE ? '🔴 ON' : '🟢 OFF'}
+👁️ *Monetization:* ${IS_GROWTH_LOCK ? '🟢 AUTO' : '🔴 DISABLED'}
+🌐 *APP URL:* \`${process.env.APP_URL || 'Not Set'}\`
+� *Ping Status:* \`${LAST_PING_STATUS}\`
+
+�📊 *Total Stats:* 
+└ Users: \`${stats.totalUsers}\` 
+└ Files: \`${stats.totalFiles}\``;
 
     const keyboard = Markup.inlineKeyboard([
         [Markup.button.callback(IS_MAINTENANCE ? '🟢 Disable Mnt' : '🔴 Enable Mnt', 'toggle_mnt')],
-        [Markup.button.callback(IS_GROWTH_LOCK ? '🔴 Disable Lock' : '🟢 Enable Lock', 'toggle_gl')],
+        [Markup.button.callback(IS_GROWTH_LOCK ? '🔴 Disable Crypto Mode' : '🟢 Enable Crypto Mode', 'toggle_gl')],
         [Markup.button.callback('🔄 Refresh Stats', 'refresh_admin')]
     ]);
 
@@ -979,18 +989,22 @@ bot.action('refresh_admin', async (ctx) => {
 
 async function triggerAdminRefresh(ctx) {
     const stats = await getDatabaseStats();
-    const adminText = `🛠️ *Admin Dashboard*\n\n` +
-        `🚦 *Maintenance:* ${IS_MAINTENANCE ? '🔴 ON' : '🟢 OFF'}\n` +
-        `👁️ *Monetization:* ${IS_GROWTH_LOCK ? '🟢 AUTO' : '🔴 DISABLED'}\n` +
-        ` *Tracking Channel:* \`${FSUB_CHANNEL_ID || 'Not Set'}\`\n` +
-        `📦 *Last Post ID:* \`${LAST_FSUB_POST_ID || 'Waiting...'}\`\n\n` +
-        `📊 *Total Stats:* \n` +
-        `└ Users: \`${stats.totalUsers}\` \n` +
-        `└ Files: \`${stats.totalFiles}\``;
+    const adminText = `🛠️ *Admin Dashboard*
+
+🚦 *Maintenance:* ${IS_MAINTENANCE ? '🔴 ON' : '🟢 OFF'}
+👁️ *Monetization:* ${IS_GROWTH_LOCK ? '🟢 AUTO' : '🔴 DISABLED'}
+📍 *Tracking:* \`${FSUB_CHANNEL_ID || 'Not Set'}\`
+📦 *Last Post:* \`${LAST_FSUB_POST_ID || 'Waiting...'}\`
+🌐 *URL:* \`${process.env.APP_URL || 'Not Set'}\`
+📡 *Ping:* \`${LAST_PING_STATUS}\`
+
+📊 *Total Stats:* 
+└ Users: \`${stats.totalUsers}\` 
+└ Files: \`${stats.totalFiles}\``;
 
     const keyboard = Markup.inlineKeyboard([
         [Markup.button.callback(IS_MAINTENANCE ? '🟢 Disable Mnt' : '🔴 Enable Mnt', 'toggle_mnt')],
-        [Markup.button.callback(IS_VIEW_UNLOCK_ENABLED ? '🔴 Disable Lock' : '🟢 Enable Lock', 'toggle_vu')],
+        [Markup.button.callback(IS_GROWTH_LOCK ? '🔴 Disable Crypto' : '🟢 Enable Crypto', 'toggle_gl')],
         [Markup.button.callback('🔄 Refresh Stats', 'refresh_admin')]
     ]);
 
@@ -1530,18 +1544,29 @@ async function startBot() {
     }).listen(port);
     console.log(`📡 Health check server listening on port ${port}`);
 
-    // Self-pinging utility to keep the bot alive (similar to your Python script)
-    const APP_URL = process.env.APP_URL; // e.g., https://your-app-name.koyeb.app/
+    // Self-pinging utility to keep the bot alive (Improved for Koyeb)
+    const APP_URL = process.env.APP_URL;
     if (APP_URL) {
-        const https = require('https');
+        const httpLib = APP_URL.startsWith('https') ? require('https') : require('http');
         console.log(`🚀 Self-ping enabled for: ${APP_URL}`);
+
         setInterval(() => {
-            https.get(APP_URL, (res) => {
-                console.log(`📡 Self-ping status: ${res.statusCode}`);
+            const startTime = Date.now();
+            httpLib.get(APP_URL, (res) => {
+                const latency = Date.now() - startTime;
+                LAST_PING_STATUS = `✅ OK (${res.statusCode}) - ${latency}ms`;
+                LAST_PING_TIME = new Date();
+                if (res.statusCode !== 200) {
+                    console.warn(`📡 Self-ping warning: Status ${res.statusCode}`);
+                }
             }).on('error', (err) => {
+                LAST_PING_STATUS = `❌ Error: ${err.message}`;
+                LAST_PING_TIME = new Date();
                 console.error('❌ Self-ping error:', err.message);
             });
-        }, 90 * 1000); // Ping every 90 seconds
+        }, 60 * 1000); // Ping every 60 seconds (Standard for keeping free tiers awake)
+    } else {
+        LAST_PING_STATUS = '⚠️ APP_URL not set';
     }
 
     // Enable graceful stop
