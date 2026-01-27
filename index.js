@@ -87,6 +87,9 @@ async function connectDB() {
 
         // Create indexes
         await filesCollection.createIndex({ file_name: 'text' });
+
+        // Fix: Remove documents with null user_id before creating unique index
+        await usersCollection.deleteMany({ user_id: null });
         await usersCollection.createIndex({ user_id: 1 }, { unique: true });
 
         // TTL Indexes for memory optimization (Auto-delete old data)
