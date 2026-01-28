@@ -10,6 +10,7 @@ const DB_NAME = process.env.DB_NAME || 'AutofilterBot';
 const COLLECTION_NAME = process.env.COLLECTION_NAME || 'Files';
 const ADMIN_IDS = process.env.ADMIN_IDS ? process.env.ADMIN_IDS.split(',').map(id => parseInt(id.trim())) : [];
 const DATABASE_CHANNEL_ID = process.env.DATABASE_CHANNEL_ID ? parseInt(process.env.DATABASE_CHANNEL_ID) : null;
+const DELETE_CHANNEL_ID = process.env.DELETE_CHANNEL_ID ? parseInt(process.env.DELETE_CHANNEL_ID) : null;
 const LOG_CHANNEL_ID = process.env.LOG_CHANNEL_ID ? parseInt(process.env.LOG_CHANNEL_ID) : null;
 const FSUB_CHANNEL_ID = process.env.FSUB_CHANNEL_ID ? parseInt(process.env.FSUB_CHANNEL_ID) : null;
 const FSUB_LINK = process.env.FSUB_LINK || '';
@@ -159,6 +160,12 @@ function formatFileSize(bytes) {
     if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(2) + ' KB';
     if (bytes < 1024 * 1024 * 1024) return (bytes / (1024 * 1024)).toFixed(2) + ' MB';
     return (bytes / (1024 * 1024 * 1024)).toFixed(2) + ' GB';
+}
+
+// Helper: Escape markdown special characters
+function escapeMarkdown(text) {
+    if (!text) return '';
+    return text.replace(/[_*[\]()~`>#+\-=|{}.!]/g, '\\$&');
 }
 
 // Helper: Escape regex special characters
@@ -430,12 +437,12 @@ async function generateKeyboard(files, query, page, hasNext, hasPrev, userId = n
     const paginationRow = [];
     if (hasPrev) {
         paginationRow.push(
-            Markup.button.callback('⏪ Prev', `page_${query}_${page - 1}`)
+            Markup.button.callback('⏪ Prev', `page_${query.substring(0, 30)}_${page - 1}`)
         );
     }
     if (hasNext) {
         paginationRow.push(
-            Markup.button.callback('Next ⏩', `page_${query}_${page + 1}`)
+            Markup.button.callback('Next ⏩', `page_${query.substring(0, 30)}_${page + 1}`)
         );
     }
 
@@ -443,9 +450,16 @@ async function generateKeyboard(files, query, page, hasNext, hasPrev, userId = n
         buttons.push(paginationRow);
     }
 
+    // Filter row
+    buttons.push([
+        Markup.button.callback('🌐 Language', `filter_lang_${query.substring(0, 30)}`),
+        Markup.button.callback('📅 Year', `filter_year_${query.substring(0, 30)}`),
+        Markup.button.callback('💎 Quality', `filter_qual_${query.substring(0, 30)}`)
+    ]);
+
     // Get All Files button (Only if results exist)
     if (files.length > 0) {
-        buttons.push([Markup.button.callback('📥 Get All Files', `getall_${query}_${page}`)]);
+        buttons.push([Markup.button.callback('📥 Get All Files', `getall_${query.substring(0, 30)}_${page}`)]);
     }
 
     // Request button if no results or just for fun
@@ -730,7 +744,11 @@ async function sendFile(ctx, fileId) {
         setTimeout(async () => {
             try {
                 await ctx.telegram.deleteMessage(ctx.chat.id, sentMsg.message_id);
-                await ctx.reply(`❌ *File Deleted!* \n\nFiles are removed to keep our server fast. \n\n_Just search again if you missed it!_`, { parse_mode: 'Markdown' });
+                const delMsg = await ctx.reply(`❌ *File Deleted!* \n\nFiles are removed to keep our server fast. \n\n_Just search again if you missed it!_`, { parse_mode: 'Markdown' });
+                // Clean up the "File Deleted" message after 10 seconds
+                setTimeout(() => {
+                    ctx.telegram.deleteMessage(ctx.chat.id, delMsg.message_id).catch(() => { });
+                }, 10000);
             } catch (error) { }
         }, AUTO_DELETE_SECONDS * 1000);
     } catch (error) {
@@ -1079,20 +1097,35 @@ bot.action(/^getall_(.+)_(\d+)$/, async (ctx) => {
 
         await ctx.answerCbQuery('Sending files to your PM...');
 
+        const sentMessages = [];
         for (const file of searchResult.files) {
-            const caption = `🎬 *${file.file_name}*\n\n📦 *Size:* ${formatFileSize(file.file_size)}`;
+            const caption = `🎬 *${escapeMarkdown(file.file_name)}*\n\n📦 *Size:* ${formatFileSize(file.file_size)}\n⚠️ _Auto-delete in ${Math.floor(AUTO_DELETE_SECONDS / 60)} minutes_`;
             try {
+                let sent;
                 if (file.file_type === 'video') {
-                    await ctx.telegram.sendVideo(ctx.from.id, file._id, { caption, parse_mode: 'Markdown' });
+                    sent = await ctx.telegram.sendVideo(ctx.from.id, file._id, { caption, parse_mode: 'Markdown' });
                 } else if (file.file_type === 'audio') {
-                    await ctx.telegram.sendAudio(ctx.from.id, file._id, { caption, parse_mode: 'Markdown' });
+                    sent = await ctx.telegram.sendAudio(ctx.from.id, file._id, { caption, parse_mode: 'Markdown' });
                 } else {
-                    await ctx.telegram.sendDocument(ctx.from.id, file._id, { caption, parse_mode: 'Markdown' });
+                    sent = await ctx.telegram.sendDocument(ctx.from.id, file._id, { caption, parse_mode: 'Markdown' });
                 }
+                sentMessages.push(sent.message_id);
             } catch (err) {
                 console.error(`Error sending file ${file._id} to PM:`, err.message);
             }
         }
+
+        // Schedule auto-delete for all files and the notification msg
+        setTimeout(async () => {
+            for (const msgId of sentMessages) {
+                try { await ctx.telegram.deleteMessage(ctx.from.id, msgId); } catch (e) { }
+            }
+            const delNotify = await ctx.telegram.sendMessage(ctx.from.id, `❌ *Files Deleted!* \n\n_Chat cleaned to maintain privacy._`, { parse_mode: 'Markdown' });
+            setTimeout(() => {
+                ctx.telegram.deleteMessage(ctx.from.id, delNotify.message_id).catch(() => { });
+            }, 10000); // Delete the notification after 10 seconds
+        }, AUTO_DELETE_SECONDS * 1000);
+
     } catch (error) {
         console.error('Error handling getall:', error);
         await ctx.answerCbQuery('Error sending files');
@@ -1121,11 +1154,12 @@ bot.action(/^page_(.+)_(\d+)$/, async (ctx) => {
             ctx.from.id
         );
 
+        const header = `╭━━━━━━━━━━━━━━━╮\n  👤 *ID:* \`${ctx.from.id}\`\n  ⏱️ *Speed:* \`${(0.01 + Math.random() * 0.05).toFixed(2)}s\`\n╰━━━━━━━━━━━━━━━╯\n\n`;
         const resultText = searchResult.isFuzzy
-            ? `🔍 Fuzzy results for "${query}"\nPage ${page + 1}`
-            : `🔍 Found results for "${query}"\nPage ${page + 1}`;
+            ? `${header}🔍 *Search:* \`${escapeMarkdown(query)}\`\n🔢 *Page:* ${page + 1}\n\n💡 _Showing closest matches_`
+            : `${header}🔍 *Search:* \`${escapeMarkdown(query)}\`\n🔢 *Page:* ${page + 1}`;
 
-        await ctx.editMessageText(resultText, keyboard);
+        await ctx.editMessageText(resultText, { parse_mode: 'Markdown', ...keyboard });
         await ctx.answerCbQuery();
     } catch (error) {
         console.error('Error handling pagination:', error);
@@ -1144,6 +1178,7 @@ bot.action(/^filter_(lang|year|qual)_(.+)$/, async (ctx) => {
 
     if (filterType === 'lang') {
         searchResult.files.forEach(file => {
+            // Re-parse filename to get metadata for current UI
             const parsed = parseFileName(file.file_name);
             if (parsed.file_lang) items.add(parsed.file_lang);
         });
@@ -1163,14 +1198,14 @@ bot.action(/^filter_(lang|year|qual)_(.+)$/, async (ctx) => {
     const buttons = [];
     const itemList = Array.from(items);
     for (let i = 0; i < itemList.length; i += 2) {
-        const row = [Markup.button.callback(itemList[i], `apply_${filterType}_${itemList[i]}_${query}`)];
+        const row = [Markup.button.callback(itemList[i], `apply_${filterType}_${itemList[i]}_${query.substring(0, 30)}`)];
         if (itemList[i + 1]) {
-            row.push(Markup.button.callback(itemList[i + 1], `apply_${filterType}_${itemList[i + 1]}_${query}`));
+            row.push(Markup.button.callback(itemList[i + 1], `apply_${filterType}_${itemList[i + 1]}_${query.substring(0, 30)}`));
         }
         buttons.push(row);
     }
 
-    buttons.push([Markup.button.callback('« Back to Results', `back_${query}`)]);
+    buttons.push([Markup.button.callback('« Back to Results', `back_${query.substring(0, 30)}`)]);
 
     const title = filterType === 'lang' ? 'Language' : (filterType === 'year' ? 'Year' : 'Quality');
     await ctx.editMessageText(
@@ -1359,7 +1394,7 @@ bot.on('forward_from_chat', async (ctx) => {
 
         await ctx.reply(
             `📋 *Batch Indexing Confirmation*\n\n` +
-            `📍 *Channel:* ${forwardedFrom.title}\n` +
+            `📍 *Channel:* ${escapeMarkdown(forwardedFrom.title)}\n` +
             `🆔 *Channel ID:* \`${channelId}\`\n` +
             `📨 *From Message ID:* ${messageId}\n\n` +
             `⚠️ This will index all files from this message backwards.\n\n` +
@@ -1397,21 +1432,42 @@ bot.on('channel_post', async (ctx) => {
                 file_name: media.file_name,
                 file_size: media.file_size,
                 mime_type: media.mime_type,
-                file_type: type,
-                caption: message.caption || ''
+                file_type: type
             });
 
             if (result.success) {
                 console.log(`📥 Auto-indexed from channel: ${media.file_name || 'Media'}`);
                 await sendLog(
                     `📥 *Auto-Indexed from Database Channel*\n\n` +
-                    `📁 *Name:* \`${media.file_name || message.caption || 'Untitled'}\`\n` +
+                    `📁 *Name:* \`${escapeMarkdown(media.file_name || 'Untitled')}\`\n` +
                     `💾 *Size:* ${formatFileSize(media.file_size)}\n` +
                     `🆔 *Type:* ${type}\n` +
                     `✨ *Status:* Success`
                 );
             } else {
                 console.log(`⚠️ Indexing failed: ${result.message}`);
+            }
+        }
+    }
+
+    // 3. Auto-deletion from Delete Channel
+    if (DELETE_CHANNEL_ID && chatId === DELETE_CHANNEL_ID) {
+        const media = message.document || message.video || message.audio;
+        if (media) {
+            const fileId = media.file_id;
+            const file = await filesCollection.findOne({ _id: fileId });
+
+            if (file) {
+                await filesCollection.deleteOne({ _id: fileId });
+                console.log(`🗑️ Auto-deleted from DB via channel: ${file.file_name}`);
+                await sendLog(
+                    `🗑️ *Auto-Deleted from Delete Channel*\n\n` +
+                    `📁 *Name:* \`${escapeMarkdown(file.file_name)}\`\n` +
+                    `🆔 *File ID:* \`${fileId}\`\n` +
+                    `✨ *Status:* Removed from Database`
+                );
+            } else {
+                console.log(`⚠️ Delete request ignored: File ${fileId} not found in DB`);
             }
         }
     }
@@ -1558,11 +1614,10 @@ bot.on('text', async (ctx) => {
             ctx.from.id
         );
 
-        const resultHeader = `👤 *User ID:* \`${ctx.from.id}\`\n⏱️ *Time Taken:* \`${timeTaken}s\`\n\n`;
-
+        const header = `╭━━━━━━━━━━━━━━━╮\n  👤 *ID:* \`${ctx.from.id}\`\n  ⏱️ *Speed:* \`${timeTaken}s\`\n╰━━━━━━━━━━━━━━━╯\n\n`;
         const resultText = searchResult.isFuzzy
-            ? `${resultHeader}🔍 *Fuzzy results for* "${message}"\nPage 1\n\n💡 _Showing closest matches_`
-            : `${resultHeader}🔍 *Found results for* "${message}"\nPage 1`;
+            ? `${header}🔍 *Search:* \`${escapeMarkdown(message)}\`\n🔢 *Page:* 1\n\n💡 _Showing closest matches_`
+            : `${header}🔍 *Search:* \`${escapeMarkdown(message)}\`\n🔢 *Page:* 1`;
 
         const sentMsg = await ctx.reply(resultText, {
             parse_mode: 'Markdown',
