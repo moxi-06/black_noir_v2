@@ -161,6 +161,11 @@ function formatFileSize(bytes) {
     return (bytes / (1024 * 1024 * 1024)).toFixed(2) + ' GB';
 }
 
+// Helper: Escape regex special characters
+function escapeRegex(string) {
+    return string.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
 // Helper: Parse file name for language, year, and quality
 function parseFileName(fileName) {
     const languages = ['English', 'Hindi', 'Tamil', 'Telugu', 'Malayalam', 'Kannada', 'Bengali', 'Marathi'];
@@ -327,25 +332,26 @@ async function getDatabaseStats() {
 async function searchFiles(query, page = 0, filters = {}) {
     try {
         const skip = page * RESULTS_PER_PAGE;
+        console.log(`🔍 Search: query="${query}", page=${page}, filters=`, filters);
 
         // Build query with filters
         let searchQuery = {};
         const conditions = [];
 
-        // Use regex for basic search
+        // Use regex for basic search (Escaped for safety)
         if (query) {
-            conditions.push({ file_name: { $regex: new RegExp(query, 'i') } });
+            conditions.push({ file_name: { $regex: new RegExp(escapeRegex(query), 'i') } });
         }
 
-        // Add filters (now additive)
+        // Add filters (Regex match against file_name for scoped filtering)
         if (filters.file_lang) {
-            conditions.push({ file_name: { $regex: new RegExp(filters.file_lang, 'i') } });
+            conditions.push({ file_name: { $regex: new RegExp(escapeRegex(filters.file_lang), 'i') } });
         }
         if (filters.year) {
             conditions.push({ file_name: { $regex: new RegExp(filters.year, 'i') } });
         }
         if (filters.quality) {
-            conditions.push({ file_name: { $regex: new RegExp(filters.quality, 'i') } });
+            conditions.push({ file_name: { $regex: new RegExp(escapeRegex(filters.quality), 'i') } });
         }
 
         if (conditions.length > 1) {
@@ -354,18 +360,24 @@ async function searchFiles(query, page = 0, filters = {}) {
             searchQuery = conditions[0];
         }
 
+        console.log(`📡 MongoDB Query: ${JSON.stringify(searchQuery)}`);
+
         const results = await filesCollection
             .find(searchQuery)
+            .sort({ _id: -1 }) // Sort by ID descending (newest first approximation)
             .skip(skip)
             .limit(RESULTS_PER_PAGE + 1)
             .toArray();
+
+        console.log(`📊 Found ${results.length} results`);
 
         const hasMore = results.length > RESULTS_PER_PAGE;
         const files = hasMore ? results.slice(0, RESULTS_PER_PAGE) : results;
 
         // If no results with regex, try fuzzy search
         if (files.length === 0 && query && !filters.file_lang && !filters.year) {
-            const allFiles = await filesCollection.find({}).limit(1000).toArray();
+            console.log('✨ Trying fuzzy fallback...');
+            const allFiles = await filesCollection.find({}).sort({ _id: -1 }).limit(1000).toArray();
             const fuse = new Fuse(allFiles, {
                 keys: ['file_name'],
                 threshold: 0.4,
@@ -384,48 +396,33 @@ async function searchFiles(query, page = 0, filters = {}) {
             };
         }
 
-        const resultData = {
+        if (query && page === 0 && !filters.file_lang && !filters.year && !filters.quality) {
+            await trackSearch(query);
+        }
+
+        return {
             files,
             hasNext: hasMore,
             hasPrev: page > 0,
             currentPage: page,
             isFuzzy: false
         };
-
-        if (query && page === 0 && !filters.file_lang && !filters.year && !filters.quality) {
-            await trackSearch(query);
-        }
-
-        return resultData;
     } catch (error) {
         console.error('Search error:', error);
         return { files: [], hasNext: false, hasPrev: false, currentPage: 0, isFuzzy: false };
     }
 }
 
-// Generate inline keyboard for search results
 // Generate keyboard with shortlink support
 async function generateKeyboard(files, query, page, hasNext, hasPrev, userId = null) {
     const buttons = [];
 
-    // Filter buttons (only on first page)
-    if (page === 0 && files.length > 0) {
-        const filterRow1 = [];
-        const filterRow2 = [];
-
-        filterRow1.push(Markup.button.callback('🌐 Language', `filter_lang_${query}`));
-        filterRow1.push(Markup.button.callback('📅 Year', `filter_year_${query}`));
-        filterRow2.push(Markup.button.callback('✨ Quality', `filter_qual_${query}`));
-
-        buttons.push(filterRow1);
-        buttons.push(filterRow2);
-    }
-
     // File buttons
     for (const file of files) {
-        const qualityTag = file.quality ? ` [${file.quality}]` : '';
+        // Use file_ref for the link if available (shorter), otherwise fallback to _id
+        const linkId = file.file_ref || file._id;
         buttons.push([
-            Markup.button.url(`🎬 ${file.file_name}${qualityTag}`, `https://t.me/${bot.botInfo.username}?start=file_${file._id}`)
+            Markup.button.url(`🎬 ${file.file_name}`, `https://t.me/${bot.botInfo.username}?start=file_${linkId}`)
         ]);
     }
 
@@ -446,6 +443,11 @@ async function generateKeyboard(files, query, page, hasNext, hasPrev, userId = n
         buttons.push(paginationRow);
     }
 
+    // Get All Files button (Only if results exist)
+    if (files.length > 0) {
+        buttons.push([Markup.button.callback('📥 Get All Files', `getall_${query}_${page}`)]);
+    }
+
     // Request button if no results or just for fun
     if (files.length === 0) {
         buttons.push([Markup.button.callback('🆘 Request Movie', `req_${query}`)]);
@@ -459,7 +461,6 @@ async function indexFile(fileData) {
     try {
         // Fallback for missing file names (common in videos)
         const fileName = fileData.file_name || fileData.caption || 'Untitled Media';
-        const { year, file_lang, quality } = parseFileName(fileName);
 
         const document = {
             _id: fileData.file_id,
@@ -467,12 +468,7 @@ async function indexFile(fileData) {
             file_name: fileName,
             file_size: fileData.file_size,
             file_type: fileData.file_type || 'document',
-            mime_type: fileData.mime_type,
-            caption: fileData.caption || '',
-            year: year,
-            file_lang: file_lang,
-            quality: quality,
-            indexed_at: new Date()
+            mime_type: fileData.mime_type
         };
 
         // Check if file already exists
@@ -685,7 +681,11 @@ bot.start(async (ctx) => {
 // Helper: Send file with auto-delete and CTA button
 async function sendFile(ctx, fileId) {
     try {
-        const file = await filesCollection.findOne({ _id: fileId });
+        // Retrieve file by _id OR file_ref (to support both old and new links)
+        const file = await filesCollection.findOne({
+            $or: [{ _id: fileId }, { file_ref: fileId }]
+        });
+
         if (!file) {
             await ctx.reply('❌ File not found or has been deleted.');
             return;
@@ -716,7 +716,6 @@ async function sendFile(ctx, fileId) {
         const deleteInMins = Math.floor(AUTO_DELETE_SECONDS / 60);
         const caption = `🎬 *${file.file_name}*\n\n` +
             `📦 *Size:* ${formatFileSize(file.file_size)}\n` +
-            `✨ *Quality:* ${file.quality || 'N/A'}\n\n` +
             `⚠️ _This file will auto-delete in ${deleteInMins} minutes_`;
 
         let sentMsg;
@@ -1065,6 +1064,41 @@ _Powered by Noir Advanced Indexer_`;
     await ctx.editMessageText(helpText, { parse_mode: 'Markdown', ...keyboard });
 });
 
+// Handle getall callback
+bot.action(/^getall_(.+)_(\d+)$/, async (ctx) => {
+    try {
+        const query = ctx.match[1];
+        const page = parseInt(ctx.match[2]);
+
+        const searchResult = await searchFiles(query, page);
+
+        if (searchResult.files.length === 0) {
+            await ctx.answerCbQuery('No files found');
+            return;
+        }
+
+        await ctx.answerCbQuery('Sending files to your PM...');
+
+        for (const file of searchResult.files) {
+            const caption = `🎬 *${file.file_name}*\n\n📦 *Size:* ${formatFileSize(file.file_size)}`;
+            try {
+                if (file.file_type === 'video') {
+                    await ctx.telegram.sendVideo(ctx.from.id, file._id, { caption, parse_mode: 'Markdown' });
+                } else if (file.file_type === 'audio') {
+                    await ctx.telegram.sendAudio(ctx.from.id, file._id, { caption, parse_mode: 'Markdown' });
+                } else {
+                    await ctx.telegram.sendDocument(ctx.from.id, file._id, { caption, parse_mode: 'Markdown' });
+                }
+            } catch (err) {
+                console.error(`Error sending file ${file._id} to PM:`, err.message);
+            }
+        }
+    } catch (error) {
+        console.error('Error handling getall:', error);
+        await ctx.answerCbQuery('Error sending files');
+    }
+});
+
 // Handle pagination callbacks
 bot.action(/^page_(.+)_(\d+)$/, async (ctx) => {
     try {
@@ -1185,13 +1219,17 @@ bot.action(/^apply_(lang|year|qual)_(.+)_(.+)$/, async (ctx) => {
 bot.action(/^delete_confirm_(.+)$/, async (ctx) => {
     if (!isAdmin(ctx.from.id)) return;
     const fileId = ctx.match[1];
-    const file = await filesCollection.findOne({ _id: fileId });
+    // Find by _id or file_ref
+    const file = await filesCollection.findOne({
+        $or: [{ _id: fileId }, { file_ref: fileId }]
+    });
 
     if (!file) {
         return ctx.answerCbQuery('❌ File not found in DB', { show_alert: true });
     }
 
     const keyboard = Markup.inlineKeyboard([
+        // Pass fileId (which might be file_ref) to execute
         [Markup.button.callback('✅ Yes, Delete', `delete_execute_${fileId}`)],
         [Markup.button.callback('❌ Cancel', 'delete_cancel')]
     ]);
@@ -1199,7 +1237,8 @@ bot.action(/^delete_confirm_(.+)$/, async (ctx) => {
     await ctx.editMessageText(
         `⚠️ *Are you sure you want to delete this file?*\n\n` +
         `📁 *Name:* ${file.file_name}\n` +
-        `🆔 *ID:* \`${fileId}\`\n\n` +
+        // Show file_ref if that's what we matched, or just a truncated ID
+        `🆔 *ID Ref:* \`${fileId.substring(0, 15)}...\`\n\n` +
         `This action cannot be undone.`,
         { parse_mode: 'Markdown', ...keyboard }
     );
@@ -1209,10 +1248,15 @@ bot.action(/^delete_confirm_(.+)$/, async (ctx) => {
 bot.action(/^delete_execute_(.+)$/, async (ctx) => {
     if (!isAdmin(ctx.from.id)) return;
     const fileId = ctx.match[1];
-    const file = await filesCollection.findOne({ _id: fileId });
+
+    // Find first to get details (optional but good for logs)
+    const file = await filesCollection.findOne({
+        $or: [{ _id: fileId }, { file_ref: fileId }]
+    });
 
     if (file) {
-        await filesCollection.deleteOne({ _id: fileId });
+        // Delete by _id from the found file
+        await filesCollection.deleteOne({ _id: file._id });
         await ctx.editMessageText(`✅ *Deleted Successfully!*\n\n📁 ${file.file_name}`, { parse_mode: 'Markdown' });
 
         await sendLog(
@@ -1399,8 +1443,10 @@ bot.on(['document', 'video', 'audio'], async (ctx) => {
                 `👤 *Admin:* ${ctx.from.first_name} (${ctx.from.id})`
             );
         } else if (result.duplicate) {
+            // Use file_unique_id (file_ref) for callback to avoid length limits
+            const callbackId = media.file_unique_id;
             const keyboard = Markup.inlineKeyboard([
-                [Markup.button.callback('🗑️ Delete from DB', `delete_confirm_${media.file_id}`)]
+                [Markup.button.callback('🗑️ Delete from DB', `delete_confirm_${callbackId}`)]
             ]);
             await ctx.reply(`⚠️ *Media already indexed:*\n📁 ${media.file_name || ctx.message.caption || 'Untitled'}\n\nDo you want to remove it?`, { parse_mode: 'Markdown', ...keyboard });
         } else {
@@ -1489,26 +1535,17 @@ bot.on('text', async (ctx) => {
     }
 
     try {
+        const startTime = Date.now();
         const searchResult = await searchFiles(message, 0);
+        const endTime = Date.now();
+        const timeTaken = ((endTime - startTime) / 1000).toFixed(2);
 
         if (searchResult.files.length === 0) {
             // Only reply to failed searches in PM, or if it's explicitly a command-like text in groups
             if (ctx.chat.type === 'private' || message.includes('movie') || message.includes('film')) {
                 await ctx.reply(`❌ No results found for "${message}"\n\n💡 Try different keywords or check spelling`,
-                    await generateKeyboard([], message, 0, false, false, ctx.from.id));
+                    { reply_to_message_id: ctx.message.message_id, ...await generateKeyboard([], message, 0, false, false, ctx.from.id) });
             }
-            return;
-        }
-
-        // In groups, if it's just a regular message, show a "Found Results" button instead of full list to save space
-        if (ctx.chat.type !== 'private' && message.length < 20) {
-            const keyboard = Markup.inlineKeyboard([
-                [Markup.button.callback(`🔍 Click to view results (${searchResult.files.length})`, `page_${message}_0`)]
-            ]);
-            const sentMsg = await ctx.reply(`🎬 I found some movies for "${message}"`, keyboard);
-
-            // Auto-delete after 5 minutes (300s) to keep group clean
-            setTimeout(() => ctx.telegram.deleteMessage(ctx.chat.id, sentMsg.message_id).catch(() => { }), 300 * 1000);
             return;
         }
 
@@ -1521,13 +1558,19 @@ bot.on('text', async (ctx) => {
             ctx.from.id
         );
 
+        const resultHeader = `👤 *User ID:* \`${ctx.from.id}\`\n⏱️ *Time Taken:* \`${timeTaken}s\`\n\n`;
+
         const resultText = searchResult.isFuzzy
-            ? `🔍 *Fuzzy results for* "${message}"\nPage 1\n\n💡 _Showing closest matches_`
-            : `🔍 *Found results for* "${message}"\nPage 1`;
+            ? `${resultHeader}🔍 *Fuzzy results for* "${message}"\nPage 1\n\n💡 _Showing closest matches_`
+            : `${resultHeader}🔍 *Found results for* "${message}"\nPage 1`;
 
-        const sentMsg = await ctx.reply(resultText, { parse_mode: 'Markdown', ...keyboard });
+        const sentMsg = await ctx.reply(resultText, {
+            parse_mode: 'Markdown',
+            reply_to_message_id: ctx.message.message_id,
+            ...keyboard
+        });
 
-        // Group Auto-Cleaner: Delete search result in groups after 60 seconds
+        // Group Auto-Cleaner: Delete search result in groups after 5 minutes
         if (ctx.chat.type !== 'private') {
             setTimeout(async () => {
                 try {
