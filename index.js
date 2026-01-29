@@ -13,14 +13,32 @@ const DATABASE_CHANNEL_ID = process.env.DATABASE_CHANNEL_ID ? parseInt(process.e
 const DELETE_CHANNEL_ID = process.env.DELETE_CHANNEL_ID ? parseInt(process.env.DELETE_CHANNEL_ID) : null;
 const LOG_CHANNEL_ID = process.env.LOG_CHANNEL_ID ? parseInt(process.env.LOG_CHANNEL_ID) : null;
 const FSUB_CHANNEL_ID = process.env.FSUB_CHANNEL_ID ? parseInt(process.env.FSUB_CHANNEL_ID) : null;
+const MONETIZATION_CHANNEL_ID = process.env.MONETIZATION_CHANNEL_ID ? parseInt(process.env.MONETIZATION_CHANNEL_ID) : null;
 const FSUB_LINK = process.env.FSUB_LINK || '';
 
 // God-Mode Configs
 let IS_MAINTENANCE = process.env.IS_MAINTENANCE === 'true';
 let IS_GROWTH_LOCK = process.env.IS_GROWTH_LOCK === 'true';
-let LAST_FSUB_POST_ID = null;
+let LAST_MONETIZATION_POST_ID = null;
 let LAST_PING_STATUS = 'Waiting...';
 let LAST_PING_TIME = null;
+// Feature Constants
+const LANGUAGES = {
+    'EN': 'English',
+    'HI': 'Hindi',
+    'TA': 'Tamil',
+    'TE': 'Telugu',
+    'ML': 'Malayalam',
+    'KN': 'Kannada',
+    'BN': 'Bengali',
+    'MR': 'Marathi',
+    'MU': 'Multi Audio'
+};
+
+const MULTI_KEYWORDS = ['multi', 'dual', 'dual audio', 'multi audio', 'audios', 'triple', 'eng-hin', 'hin-eng'];
+
+const YEARS = [];
+for (let y = new Date().getFullYear(); y >= 2000; y--) YEARS.push(y.toString());
 
 const RESULTS_PER_PAGE = 10;
 const AUTO_DELETE_SECONDS = 3600;
@@ -69,8 +87,6 @@ let db;
 let filesCollection;
 let usersCollection;
 let trendingCollection;
-let requestsCollection;
-let settingsCollection;
 let blockedKeywordsCollection;
 
 // Connect to MongoDB
@@ -95,8 +111,8 @@ async function connectDB() {
         const gl = await settingsCollection.findOne({ key: 'growth_lock' });
         if (gl) IS_GROWTH_LOCK = gl.value;
 
-        const lastPost = await settingsCollection.findOne({ key: 'last_fsub_post' });
-        if (lastPost) LAST_FSUB_POST_ID = lastPost.value;
+        const lastPost = await settingsCollection.findOne({ key: 'last_monetization_post' });
+        if (lastPost) LAST_MONETIZATION_POST_ID = lastPost.value;
 
         // Create indexes
         await filesCollection.createIndex({ file_name: 'text' });
@@ -175,23 +191,30 @@ function escapeRegex(string) {
 
 // Helper: Parse file name for language, year, and quality
 function parseFileName(fileName) {
-    const languages = ['English', 'Hindi', 'Tamil', 'Telugu', 'Malayalam', 'Kannada', 'Bengali', 'Marathi'];
     const quality = ['480p', '720p', '1080p', '1440p', '2160p', '4K', 'HDR', 'CAM', 'HDTS', 'Web-DL', 'BluRay'];
 
     const yearMatch = fileName.match(/\b(19\d{2}|20\d{2})\b/);
     const qualityMatch = quality.find(q => fileName.toLowerCase().includes(q.toLowerCase()));
 
-    let detectedLanguage = null;
-    for (const lang of languages) {
-        if (fileName.toLowerCase().includes(lang.toLowerCase())) {
-            detectedLanguage = lang;
-            break;
+    let detectedLangCode = null;
+    const lowerName = fileName.toLowerCase();
+
+    // Check Multi first
+    if (MULTI_KEYWORDS.some(k => lowerName.includes(k))) {
+        detectedLangCode = 'MU';
+    } else {
+        for (const [code, lang] of Object.entries(LANGUAGES)) {
+            if (code === 'MU') continue;
+            if (lowerName.includes(lang.toLowerCase()) || lowerName.includes(code.toLowerCase())) {
+                detectedLangCode = code;
+                break;
+            }
         }
     }
 
     return {
         year: yearMatch ? yearMatch[1] : null,
-        file_lang: detectedLanguage,
+        file_lang: detectedLangCode,
         quality: qualityMatch || null
     };
 }
@@ -352,10 +375,19 @@ async function searchFiles(query, page = 0, filters = {}) {
 
         // Add filters (Regex match against file_name for scoped filtering)
         if (filters.file_lang) {
-            conditions.push({ file_name: { $regex: new RegExp(escapeRegex(filters.file_lang), 'i') } });
+            if (filters.file_lang === 'MU') {
+                conditions.push({
+                    file_name: { $regex: new RegExp(MULTI_KEYWORDS.join('|'), 'i') }
+                });
+            } else {
+                const langName = LANGUAGES[filters.file_lang];
+                // Match "Hindi" OR "HI"
+                const pattern = langName ? `${escapeRegex(langName)}|\\b${escapeRegex(filters.file_lang)}\\b` : escapeRegex(filters.file_lang);
+                conditions.push({ file_name: { $regex: new RegExp(pattern, 'i') } });
+            }
         }
         if (filters.year) {
-            conditions.push({ file_name: { $regex: new RegExp(filters.year, 'i') } });
+            conditions.push({ file_name: { $regex: new RegExp(`\\b${filters.year}\\b`, 'i') } });
         }
         if (filters.quality) {
             conditions.push({ file_name: { $regex: new RegExp(escapeRegex(filters.quality), 'i') } });
@@ -367,7 +399,11 @@ async function searchFiles(query, page = 0, filters = {}) {
             searchQuery = conditions[0];
         }
 
-        console.log(`📡 MongoDB Query: ${JSON.stringify(searchQuery)}`);
+        // Improved Regex-aware logging
+        const loggableQuery = JSON.parse(JSON.stringify(searchQuery, (key, value) =>
+            value instanceof RegExp ? value.toString() : value
+        ));
+        console.log(`📡 MongoDB Query: ${JSON.stringify(loggableQuery)}`);
 
         const results = await filesCollection
             .find(searchQuery)
@@ -420,54 +456,136 @@ async function searchFiles(query, page = 0, filters = {}) {
     }
 }
 
-// Generate keyboard with shortlink support
-async function generateKeyboard(files, query, page, hasNext, hasPrev, userId = null) {
+// Helper: Serialize filters for callback data
+function serializeFilters(page, filters) {
+    const l = filters.file_lang || '-';
+    const y = filters.year || '-';
+    const q = filters.quality || '-';
+    return `${page}:${l}:${y}:${q}`;
+}
+
+// Helper: Deserialize filters from callback data
+function deserializeFilters(data) {
+    const parts = data.split(':');
+    return {
+        page: parseInt(parts[0]) || 0,
+        filters: {
+            file_lang: parts[1] === '-' ? null : parts[1],
+            year: parts[2] === '-' ? null : parts[2],
+            quality: parts[3] === '-' ? null : parts[3]
+        }
+    };
+}
+
+// Helper: Extract query from ctx
+async function extractQuery(ctx) {
+    // 1. From reply_to_message (Best)
+    if (ctx.callbackQuery && ctx.callbackQuery.message.reply_to_message) {
+        return ctx.callbackQuery.message.reply_to_message.text;
+    }
+    // 2. From message text with regex
+    const text = (ctx.callbackQuery ? ctx.callbackQuery.message.text : ctx.message.text) || '';
+    const match = text.match(/Search: `(.+?)`/);
+    if (match) return match[1];
+
+    // 3. From Base64 payload if it's a deep link (Handled specifically in deep link funcs)
+    return null;
+}
+
+// Generate keyboard with shortlink support and filter persistence
+async function generateKeyboard(files, query, page, hasNext, hasPrev, filters = {}, userId = null) {
     const buttons = [];
 
     // File buttons
     for (const file of files) {
-        // Use file_ref for the link if available (shorter), otherwise fallback to _id
         const linkId = file.file_ref || file._id;
+        const size = formatFileSize(file.file_size);
         buttons.push([
-            Markup.button.url(`🎬 ${file.file_name}`, `https://t.me/${bot.botInfo.username}?start=file_${linkId}`)
+            Markup.button.url(`[${size}] - ${file.file_name}`, `https://t.me/${bot.botInfo.username}?start=file_${linkId}`),
+            Markup.button.callback('🔗 Link', `get_link_${linkId}`)
         ]);
     }
 
-    // Pagination buttons
+    // Pagination row
     const paginationRow = [];
-    if (hasPrev) {
-        paginationRow.push(
-            Markup.button.callback('⏪ Prev', `page_${query.substring(0, 30)}_${page - 1}`)
-        );
-    }
-    if (hasNext) {
-        paginationRow.push(
-            Markup.button.callback('Next ⏩', `page_${query.substring(0, 30)}_${page + 1}`)
-        );
-    }
-
-    if (paginationRow.length > 0) {
-        buttons.push(paginationRow);
-    }
+    const state = serializeFilters(page, filters);
+    if (hasPrev) paginationRow.push(Markup.button.callback('⏪ Prev', `p:${page - 1}:${state.split(':').slice(1).join(':')}`));
+    if (hasNext) paginationRow.push(Markup.button.callback('Next ⏩', `p:${page + 1}:${state.split(':').slice(1).join(':')}`));
+    if (paginationRow.length > 0) buttons.push(paginationRow);
 
     // Filter row
     buttons.push([
-        Markup.button.callback('🌐 Language', `filter_lang_${query.substring(0, 30)}`),
-        Markup.button.callback('📅 Year', `filter_year_${query.substring(0, 30)}`),
-        Markup.button.callback('💎 Quality', `filter_qual_${query.substring(0, 30)}`)
+        Markup.button.callback('🌐 Language', `f:lang:${state}`),
+        Markup.button.callback('📅 Year', `f:year:${state}`),
+        Markup.button.callback('💎 Quality', `f:qual:${state}`)
     ]);
 
-    // Get All Files button (Only if results exist)
-    if (files.length > 0) {
-        buttons.push([Markup.button.callback('📥 Get All Files', `getall_${query.substring(0, 30)}_${page}`)]);
+    // Action row (Admin ONLY)
+    if (files.length > 0 && userId && isAdmin(userId)) {
+        buttons.push([
+            Markup.button.callback('📥 Get All', `gall:${state}`),
+            Markup.button.callback('🔗 Share Page', `s:${state}`)
+        ]);
     }
 
-    // Request button if no results or just for fun
-    if (files.length === 0) {
-        buttons.push([Markup.button.callback('🆘 Request Movie', `req_${query}`)]);
+    // Reset button if filters active
+    if (filters.file_lang || filters.year || filters.quality) {
+        buttons.push([Markup.button.callback('❌ Clear Filters', `p:0:-:-:-`)]);
     }
 
     return Markup.inlineKeyboard(buttons);
+}
+
+// Unified function to send/edit search results to ensure UI consistency
+async function sendSearchResults(ctx, query, page, filters = {}, isEdit = false, startTime = null) {
+    const searchResult = await searchFiles(query, page, filters);
+    const keyboard = await generateKeyboard(
+        searchResult.files,
+        query,
+        page,
+        searchResult.hasNext,
+        searchResult.hasPrev,
+        filters,
+        ctx.from.id
+    );
+
+    const speed = startTime ? ((Date.now() - startTime) / 1000).toFixed(2) : '0.02';
+    const header = `💎 *Noir Premium Results* 💎\n━━━━━━━━━━━━━━━\n👤 *User:* \`${ctx.from.id}\`\n⏱️ *Speed:* \`${speed}s\`\n━━━━━━━━━━━━━━━`;
+
+    // Build filter breadcrumbs with colorful icons
+    let filterInfo = '';
+    if (filters.file_lang || filters.year || filters.quality) {
+        filterInfo = '\n✨ *Active Filters:* ' + [
+            filters.file_lang ? `🌐 \`${LANGUAGES[filters.file_lang] || filters.file_lang}\`` : null,
+            filters.year ? `📅 \`${filters.year}\`` : null,
+            filters.quality ? `💎 \`${filters.quality}\`` : null
+        ].filter(Boolean).join(' + ');
+    }
+
+    const text = searchResult.isFuzzy
+        ? `${header}\n🔍 *Search:* \`${query}\`${filterInfo}\n🔢 *Page:* ${page + 1}\n\n💡 _Showing closest matches_`
+        : `${header}\n🔍 *Search:* \`${query}\`${filterInfo}\n🔢 *Page:* ${page + 1}`;
+
+    if (searchResult.files.length === 0 && !isEdit) {
+        if (ctx.chat.type === 'private' || query.includes('movie') || query.includes('film')) {
+            await ctx.reply(`❌ No results found for "${query}"\n\n💡 Try different keywords or check spelling`, { reply_to_message_id: ctx.message?.message_id });
+        }
+        return;
+    }
+
+    if (isEdit) {
+        try {
+            await ctx.editMessageText(text, { parse_mode: 'Markdown', ...keyboard });
+        } catch (e) {
+            // Message might be same or other error
+        }
+    } else {
+        await ctx.reply(text, {
+            parse_mode: 'Markdown',
+            reply_to_message_id: ctx.message.message_id,
+            ...keyboard
+        });
+    }
 }
 
 // Index file to MongoDB
@@ -685,6 +803,10 @@ bot.start(async (ctx) => {
         const fileId = startPayload.replace('file_', '');
         await sendFile(ctx, fileId);
         return;
+    } else if (startPayload && startPayload.startsWith('get_')) {
+        const payload = startPayload.replace('get_', '');
+        await handleDumpBatch(ctx, payload);
+        return;
     } else {
         await showWelcome(ctx);
     }
@@ -706,11 +828,12 @@ async function sendFile(ctx, fileId) {
         }
 
         // Automatic Monetization: Forward the most recent channel post
-        if (IS_GROWTH_LOCK && FSUB_CHANNEL_ID && LAST_FSUB_POST_ID) {
+        const monetizationChannel = MONETIZATION_CHANNEL_ID || FSUB_CHANNEL_ID;
+        if (IS_GROWTH_LOCK && monetizationChannel && LAST_MONETIZATION_POST_ID) {
             const userIsPremium = await isPremium(ctx.from.id);
             if (!userIsPremium) {
                 try {
-                    const forwarded = await ctx.telegram.forwardMessage(ctx.from.id, FSUB_CHANNEL_ID, LAST_FSUB_POST_ID);
+                    const forwarded = await ctx.telegram.forwardMessage(ctx.from.id, monetizationChannel, LAST_MONETIZATION_POST_ID);
                     // Single-use monetization post: Auto-delete after 5 minutes (300s)
                     setTimeout(() => {
                         ctx.telegram.deleteMessage(ctx.from.id, forwarded.message_id).catch(() => { });
@@ -720,7 +843,7 @@ async function sendFile(ctx, fileId) {
                 }
             }
         } else if (IS_GROWTH_LOCK) {
-            console.log(`📡 Monetization skipped: FSUB_ID=${!!FSUB_CHANNEL_ID}, POST_ID=${!!LAST_FSUB_POST_ID}`);
+            console.log(`📡 Monetization skipped: CHAN=${!!monetizationChannel}, POST_ID=${!!LAST_MONETIZATION_POST_ID}`);
         }
 
         const keyboard = Markup.inlineKeyboard([
@@ -925,6 +1048,54 @@ bot.command('broadcast', async (ctx) => {
     );
 });
 
+// Link generator for Dump Channel
+bot.command('link', async (ctx) => {
+    if (!isAdmin(ctx.from.id)) return;
+
+    const args = ctx.message.text.split(' ').slice(1);
+    if (args.length === 0) {
+        return ctx.reply(`❌ *Usage:* \n\n/link <start_post_url> [<end_post_url>]\n\n_Example:_ \n/link https://t.me/c/12345/100`, { parse_mode: 'Markdown' });
+    }
+
+    const startInfo = parsePostUrl(args[0]);
+    if (!startInfo) {
+        return ctx.reply('❌ Invalid start post URL. Make sure it is a valid Telegram message link.');
+    }
+
+    let endId = startInfo.messageId;
+    if (args[1]) {
+        const endInfo = parsePostUrl(args[1]);
+        if (endInfo) endId = endInfo.messageId;
+    }
+
+    // Ensure range is valid
+    const startId = Math.min(startInfo.messageId, endId);
+    const finalEndId = Math.max(startInfo.messageId, endId);
+
+    if (finalEndId - startId > 100) {
+        return ctx.reply('⚠️ Range too large! Max 100 files per link.');
+    }
+
+    // Encode payload: JSON for robustness
+    const data = JSON.stringify({
+        c: startInfo.chatId,
+        s: startId,
+        e: finalEndId
+    });
+    const payload = Buffer.from(data).toString('base64url');
+    const shareLink = `https://t.me/${ctx.botInfo.username}?start=get_${payload}`;
+
+    const count = (finalEndId - startId) + 1;
+    await ctx.reply(
+        `🔗 *Permanent File Store Link*\n\n` +
+        `📦 *Files:* \`${count}\`\n` +
+        `📍 *Ref:* \`${cleanChatId}\`\n\n` +
+        `\`${shareLink}\`\n\n` +
+        `_Anyone with this link can instantly receive these files!_`,
+        { parse_mode: 'Markdown' }
+    );
+});
+
 // Block Keyword
 bot.command('block', async (ctx) => {
     if (!isAdmin(ctx.from.id)) return;
@@ -1000,7 +1171,7 @@ bot.command('admin', async (ctx) => {
 
     const keyboard = Markup.inlineKeyboard([
         [Markup.button.callback(IS_MAINTENANCE ? '🟢 Disable Mnt' : '🔴 Enable Mnt', 'toggle_mnt')],
-        [Markup.button.callback(IS_GROWTH_LOCK ? '🔴 Disable Crypto Mode' : '🟢 Enable Crypto Mode', 'toggle_gl')],
+        [Markup.button.callback(IS_GROWTH_LOCK ? '🔴 Disable Growth Lock' : '🟢 Enable Growth Lock', 'toggle_gl')],
         [Markup.button.callback('🔄 Refresh Stats', 'refresh_admin')]
     ]);
 
@@ -1037,13 +1208,13 @@ bot.action('refresh_admin', async (ctx) => {
 async function triggerAdminRefresh(ctx) {
     const stats = await getDatabaseStats();
     const adminText = `🛠️ *Admin Dashboard*
-
-🚦 *Maintenance:* ${IS_MAINTENANCE ? '🔴 ON' : '🟢 OFF'}
-👁️ *Monetization:* ${IS_GROWTH_LOCK ? '🟢 AUTO' : '🔴 DISABLED'}
-📍 *Tracking:* \`${FSUB_CHANNEL_ID || 'Not Set'}\`
-📦 *Last Post:* \`${LAST_FSUB_POST_ID || 'Waiting...'}\`
-🌐 *URL:* \`${process.env.APP_URL || 'Not Set'}\`
-📡 *Ping:* \`${LAST_PING_STATUS}\`
+ 
+ 🚦 *Maintenance:* ${IS_MAINTENANCE ? '🔴 ON' : '🟢 OFF'}
+ 👁️ *Monetization:* ${IS_GROWTH_LOCK ? '🟢 AUTO' : '🔴 DISABLED'}
+ 📍 *Tracking:* \`${FSUB_CHANNEL_ID || 'Not Set'}\`
+ 📦 *Last Post:* \`${LAST_MONETIZATION_POST_ID || 'Waiting...'}\`
+ 🌐 *URL:* \`${process.env.APP_URL || 'Not Set'}\`
+ 📡 *Ping:* \`${LAST_PING_STATUS}\`
 
 📊 *Total Stats:* 
 └ Users: \`${stats.totalUsers}\` 
@@ -1051,7 +1222,7 @@ async function triggerAdminRefresh(ctx) {
 
     const keyboard = Markup.inlineKeyboard([
         [Markup.button.callback(IS_MAINTENANCE ? '🟢 Disable Mnt' : '🔴 Enable Mnt', 'toggle_mnt')],
-        [Markup.button.callback(IS_GROWTH_LOCK ? '🔴 Disable Crypto' : '🟢 Enable Crypto', 'toggle_gl')],
+        [Markup.button.callback(IS_GROWTH_LOCK ? '🔴 Disable Growth Lock' : '🟢 Enable Growth Lock', 'toggle_gl')],
         [Markup.button.callback('🔄 Refresh Stats', 'refresh_admin')]
     ]);
 
@@ -1132,122 +1303,336 @@ bot.action(/^getall_(.+)_(\d+)$/, async (ctx) => {
     }
 });
 
-// Handle pagination callbacks
-bot.action(/^page_(.+)_(\d+)$/, async (ctx) => {
+// Handle share_page callback (Stateless Batch Link)
+bot.action(/^share_page_(.+)_(\d+)$/, async (ctx) => {
     try {
         const query = ctx.match[1];
         const page = parseInt(ctx.match[2]);
 
-        const searchResult = await searchFiles(query, page);
+        // Base64 encode the query and page safely (with encoding for special chars)
+        const payload = Buffer.from(`${encodeURIComponent(query)}|${page}`).toString('base64url');
+        const shareLink = `https://t.me/${ctx.botInfo.username}?start=search_${payload}`;
 
-        if (searchResult.files.length === 0) {
-            await ctx.answerCbQuery('No more results');
-            return;
+        await ctx.reply(`🔗 *Stateless Batch Link:*\n\n\`${shareLink}\`\n\n_Anyone with this link can instantly access these results!_`, { parse_mode: 'Markdown' });
+        await ctx.answerCbQuery('Link generated!');
+    } catch (error) {
+        console.error('Error creating batch link:', error);
+        await ctx.answerCbQuery('Error generating link');
+    }
+});
+
+// Handle get_link callback for single file
+bot.action(/^get_link_(.+)$/, async (ctx) => {
+    try {
+        const fileId = ctx.match[1];
+        const shareLink = `https://t.me/${ctx.botInfo.username}?start=file_${fileId}`;
+        await ctx.reply(`🔗 *Sharable File Link:*\n\n\`${shareLink}\``, { parse_mode: 'Markdown' });
+        await ctx.answerCbQuery('Link sent!');
+    } catch (error) {
+        console.error('Error sending link:', error);
+    }
+});
+
+// Helper: Handle stateless batch deep link
+async function handleStatelessBatch(ctx, payload) {
+    try {
+        const decoded = Buffer.from(payload, 'base64url').toString('utf8');
+        const parts = decoded.split('|').map(s => decodeURIComponent(s));
+
+        const query = parts[0];
+        const page = parseInt(parts[1]) || 0;
+        const filters = {
+            file_lang: parts[2] === '-' ? null : parts[2],
+            year: parts[3] === '-' ? null : parts[3],
+            quality: parts[4] === '-' ? null : parts[4]
+        };
+
+        let filterText = '';
+        if (filters.file_lang || filters.year || filters.quality) {
+            filterText = '\n🎯 *Filters:* ' + [
+                filters.file_lang ? `\`${LANGUAGES[filters.file_lang] || filters.file_lang}\`` : null,
+                filters.year ? `\`${filters.year}\`` : null,
+                filters.quality ? `\`${filters.quality}\`` : null
+            ].filter(Boolean).join(' + ');
         }
 
-        const keyboard = await generateKeyboard(
-            searchResult.files,
-            query,
-            page,
-            searchResult.hasNext,
-            searchResult.hasPrev,
-            ctx.from.id
-        );
+        await ctx.reply(`📥 *Delivering Batch for:* \`${query}\`${filterText}\n\n_Sending files to your PM..._`, { parse_mode: 'Markdown' });
 
-        const header = `╭━━━━━━━━━━━━━━━╮\n  👤 *ID:* \`${ctx.from.id}\`\n  ⏱️ *Speed:* \`${(0.01 + Math.random() * 0.05).toFixed(2)}s\`\n╰━━━━━━━━━━━━━━━╯\n\n`;
-        const resultText = searchResult.isFuzzy
-            ? `${header}🔍 *Search:* \`${escapeMarkdown(query)}\`\n🔢 *Page:* ${page + 1}\n\n💡 _Showing closest matches_`
-            : `${header}🔍 *Search:* \`${escapeMarkdown(query)}\`\n🔢 *Page:* ${page + 1}`;
+        const searchResult = await searchFiles(query, page, filters);
+        if (searchResult.files.length === 0) {
+            return ctx.reply('❌ No files found for this link.');
+        }
 
-        await ctx.editMessageText(resultText, { parse_mode: 'Markdown', ...keyboard });
-        await ctx.answerCbQuery();
+        const sentMessages = [];
+        for (const file of searchResult.files) {
+            const caption = `🎬 *${escapeMarkdown(file.file_name)}*\n\n📦 *Size:* ${formatFileSize(file.file_size)}\n⚠️ _Auto-delete in ${Math.floor(AUTO_DELETE_SECONDS / 60)} minutes_`;
+            try {
+                let sent;
+                if (file.file_type === 'video') {
+                    sent = await ctx.telegram.sendVideo(ctx.from.id, file._id, { caption, parse_mode: 'Markdown' });
+                } else if (file.file_type === 'audio') {
+                    sent = await ctx.telegram.sendAudio(ctx.from.id, file._id, { caption, parse_mode: 'Markdown' });
+                } else {
+                    sent = await ctx.telegram.sendDocument(ctx.from.id, file._id, { caption, parse_mode: 'Markdown' });
+                }
+                sentMessages.push(sent.message_id);
+            } catch (err) {
+                console.error(`Error sending batch file ${file._id}:`, err.message);
+            }
+        }
+
+        if (sentMessages.length > 0) {
+            setTimeout(async () => {
+                for (const msgId of sentMessages) {
+                    try { await ctx.telegram.deleteMessage(ctx.from.id, msgId); } catch (e) { }
+                }
+                const delNotify = await ctx.telegram.sendMessage(ctx.from.id, `❌ *Batch Files Deleted!* \n\n_Chat cleaned to maintain privacy._`, { parse_mode: 'Markdown' });
+                setTimeout(() => {
+                    ctx.telegram.deleteMessage(ctx.from.id, delNotify.message_id).catch(() => { });
+                }, 10000);
+            }, AUTO_DELETE_SECONDS * 1000);
+        }
     } catch (error) {
-        console.error('Error handling pagination:', error);
+        console.error('Error handling stateless batch link:', error);
+        await ctx.reply('❌ Error delivering batch files. The link might be corrupted.');
+    }
+}
+
+// Helper: Handle Dump Channel Batch Link
+async function handleDumpBatch(ctx, payload) {
+    try {
+        const decodedString = Buffer.from(payload, 'base64url').toString('utf8');
+        const data = JSON.parse(decodedString);
+        const chatId = data.c;
+        const start = parseInt(data.s);
+        const end = parseInt(data.e);
+
+        if (isNaN(start) || isNaN(end)) throw new Error('Invalid IDs');
+
+        await ctx.reply(`📥 *Fetching your files...*\n\n_Please wait while we prepare your delivery..._`, { parse_mode: 'Markdown' });
+
+        // Force Subscribe Check
+        const subscribed = await isSubscribed(ctx.from.id);
+        if (!subscribed && FSUB_CHANNEL_ID) {
+            const keyboard = Markup.inlineKeyboard([
+                [Markup.button.url('📢 Join Channel', FSUB_LINK)],
+                [Markup.button.callback('✅ I Have Joined', 'check_sub')]
+            ]);
+            return ctx.reply(`🍿 *Access Restricted*\n\nPlease join our sponsor channel to unlock these files!`, { parse_mode: 'Markdown', ...keyboard });
+        }
+
+        // Monetization Forwarding
+        const monetizationChannel = MONETIZATION_CHANNEL_ID || FSUB_CHANNEL_ID;
+        if (IS_GROWTH_LOCK && monetizationChannel && LAST_MONETIZATION_POST_ID) {
+            const userIsPremium = await isPremium(ctx.from.id);
+            if (!userIsPremium) {
+                try {
+                    const forwarded = await ctx.telegram.forwardMessage(ctx.from.id, monetizationChannel, LAST_MONETIZATION_POST_ID);
+                    setTimeout(() => {
+                        ctx.telegram.deleteMessage(ctx.from.id, forwarded.message_id).catch(() => { });
+                    }, 300 * 1000); // 5 mins
+                } catch (e) { }
+            }
+        }
+
+        const sentMessages = [];
+        const deleteInMins = Math.floor(AUTO_DELETE_SECONDS / 60);
+
+        for (let mid = start; mid <= end; mid++) {
+            try {
+                // We use copyMessage to send files without forwarding tag
+                const sent = await ctx.telegram.copyMessage(ctx.from.id, chatId, mid);
+
+                // If it's a file, we can append auto-delete info if it has a caption or even if it doesn't
+                // But copyMessage clones the message exactly. 
+                // To add custom caption, we'd need to send it separately or edit it if possible (expensive)
+                // For now, let's keep it simple and just copy.
+
+                sentMessages.push(sent.message_id);
+            } catch (err) {
+                console.error(`Failed to copy message ${mid} from ${chatId}:`, err.message);
+            }
+        }
+
+        if (sentMessages.length === 0) {
+            return ctx.reply('❌ Error: Could not retrieve files. These messages might have been deleted from the dump channel.');
+        }
+
+        // Auto-delete logic
+        setTimeout(async () => {
+            for (const msgId of sentMessages) {
+                try { await ctx.telegram.deleteMessage(ctx.from.id, msgId); } catch (e) { }
+            }
+            const delNotify = await ctx.telegram.sendMessage(ctx.from.id, `❌ *Files Deleted!* \n\n_Auto-clean active for your privacy._`, { parse_mode: 'Markdown' });
+            setTimeout(() => ctx.telegram.deleteMessage(ctx.from.id, delNotify.message_id).catch(() => { }), 8000);
+        }, AUTO_DELETE_SECONDS * 1000);
+
+    } catch (error) {
+        console.error('Error handling dump batch:', error);
+        await ctx.reply('❌ Error: The file store link is invalid or corrupted.');
+    }
+}
+
+// Handle pagination and clear filters
+bot.action(/^p:(.+)$/, async (ctx) => {
+    try {
+        const { page, filters } = deserializeFilters(ctx.match[1]);
+        const query = await extractQuery(ctx);
+        if (!query) return ctx.answerCbQuery('Query Lost. Re-search please.');
+
+        await sendSearchResults(ctx, query, page, filters, true);
+        await ctx.answerCbQuery();
+    } catch (e) {
+        console.error('Pagination error:', e);
         await ctx.answerCbQuery('Error loading page');
     }
 });
 
-// Handle filter callbacks
-bot.action(/^filter_(lang|year|qual)_(.+)$/, async (ctx) => {
-    const filterType = ctx.match[1];
-    const query = ctx.match[2];
+// Handle opening filter menus (Stateless)
+bot.action(/^f:(lang|year|qual):(.+)$/, async (ctx) => {
+    try {
+        const type = ctx.match[1];
+        const state = ctx.match[2];
+        const { page, filters } = deserializeFilters(state);
+        const query = await extractQuery(ctx);
 
-    // Extract unique items from search results
-    const searchResult = await searchFiles(query, 0);
-    const items = new Set();
+        let buttons = [];
+        let title = '';
 
-    if (filterType === 'lang') {
-        searchResult.files.forEach(file => {
-            // Re-parse filename to get metadata for current UI
-            const parsed = parseFileName(file.file_name);
-            if (parsed.file_lang) items.add(parsed.file_lang);
-        });
-    } else if (filterType === 'year') {
-        ['2025', '2024', '2023', '2022', '2021', '2020'].forEach(year => items.add(year));
-    } else if (filterType === 'qual') {
-        ['4K', '1080p', '720p', '480p', 'Cam'].forEach(q => items.add(q));
-    }
-
-    if (items.size === 0) {
-        const typeName = filterType === 'lang' ? 'languages' : (filterType === 'year' ? 'years' : 'qualities');
-        await ctx.answerCbQuery(`No ${typeName} found`);
-        return;
-    }
-
-    // Create filter buttons (grid style for better look)
-    const buttons = [];
-    const itemList = Array.from(items);
-    for (let i = 0; i < itemList.length; i += 2) {
-        const row = [Markup.button.callback(itemList[i], `apply_${filterType}_${itemList[i]}_${query.substring(0, 30)}`)];
-        if (itemList[i + 1]) {
-            row.push(Markup.button.callback(itemList[i + 1], `apply_${filterType}_${itemList[i + 1]}_${query.substring(0, 30)}`));
+        if (type === 'lang') {
+            title = 'Select Language:';
+            const langCodes = Object.keys(LANGUAGES);
+            for (let i = 0; i < langCodes.length; i += 2) {
+                const row = [Markup.button.callback(LANGUAGES[langCodes[i]], `fapl:${serializeFilters(0, { ...filters, file_lang: langCodes[i] })}`)];
+                if (langCodes[i + 1]) {
+                    row.push(Markup.button.callback(LANGUAGES[langCodes[i + 1]], `fapl:${serializeFilters(0, { ...filters, file_lang: langCodes[i + 1] })}`));
+                }
+                buttons.push(row);
+            }
+        } else if (type === 'year') {
+            // Year menu logic with pagination (if too many years)
+            return showYearMenu(ctx, 0, state);
+        } else if (type === 'qual') {
+            title = 'Select Quality:';
+            ['4K', '1080p', '720p', '480p', 'Cam'].forEach(q => {
+                buttons.push([Markup.button.callback(q, `fapl:${serializeFilters(0, { ...filters, quality: q })}`)]);
+            });
         }
+
+        buttons.push([Markup.button.callback('« Back to Results', `p:${state}`)]);
+        await ctx.editMessageText(`🎯 *Refining Search*\n${title}`, {
+            parse_mode: 'Markdown',
+            reply_markup: Markup.inlineKeyboard(buttons).reply_markup
+        });
+        await ctx.answerCbQuery();
+    } catch (e) {
+        console.error('Filter menu error:', e);
+    }
+});
+
+// Year menu specialized pagination
+async function showYearMenu(ctx, yrPage, state) {
+    const { page, filters } = deserializeFilters(state);
+    const yearsPerPage = 12;
+    const startIdx = yrPage * yearsPerPage;
+    const yearSlice = YEARS.slice(startIdx, startIdx + yearsPerPage);
+
+    let buttons = [];
+    for (let i = 0; i < yearSlice.length; i += 3) {
+        const row = [Markup.button.callback(yearSlice[i], `fapl:${serializeFilters(0, { ...filters, year: yearSlice[i] })}`)];
+        if (yearSlice[i + 1]) row.push(Markup.button.callback(yearSlice[i + 1], `fapl:${serializeFilters(0, { ...filters, year: yearSlice[i + 1] })}`));
+        if (yearSlice[i + 2]) row.push(Markup.button.callback(yearSlice[i + 2], `fapl:${serializeFilters(0, { ...filters, year: yearSlice[i + 2] })}`));
         buttons.push(row);
     }
 
-    buttons.push([Markup.button.callback('« Back to Results', `back_${query.substring(0, 30)}`)]);
+    const navRow = [];
+    if (yrPage > 0) navRow.push(Markup.button.callback('⬅️', `yrm:${yrPage - 1}:${state}`));
+    if (startIdx + yearsPerPage < YEARS.length) navRow.push(Markup.button.callback('➡️', `yrm:${yrPage + 1}:${state}`));
+    if (navRow.length > 0) buttons.push(navRow);
 
-    const title = filterType === 'lang' ? 'Language' : (filterType === 'year' ? 'Year' : 'Quality');
-    await ctx.editMessageText(
-        `Select ${title}:`,
-        { reply_markup: Markup.inlineKeyboard(buttons).reply_markup }
-    );
-    await ctx.answerCbQuery();
+    buttons.push([Markup.button.callback('« Back to Results', `p:${state}`)]);
+    await ctx.editMessageText('🎯 *Refining Search*\nSelect Year:', {
+        parse_mode: 'Markdown',
+        reply_markup: Markup.inlineKeyboard(buttons).reply_markup
+    });
+}
+
+bot.action(/^yrm:(\d+):(.+)$/, async (ctx) => {
+    return showYearMenu(ctx, parseInt(ctx.match[1]), ctx.match[2]);
 });
 
-// Handle apply filter callbacks
-bot.action(/^apply_(lang|year|qual)_(.+)_(.+)$/, async (ctx) => {
-    const filterType = ctx.match[1];
-    const filterValue = ctx.match[2];
-    const query = ctx.match[3];
+// Handle applying a filter
+bot.action(/^fapl:(.+)$/, async (ctx) => {
+    try {
+        const { page, filters } = deserializeFilters(ctx.match[1]);
+        const query = await extractQuery(ctx);
+        if (!query) return ctx.answerCbQuery('Query Lost. Re-search please.');
 
-    let filters = {};
-    if (filterType === 'lang') filters.file_lang = filterValue;
-    else if (filterType === 'year') filters.year = filterValue;
-    else if (filterType === 'qual') filters.quality = filterValue;
-
-    const searchResult = await searchFiles(query, 0, filters);
-
-    if (searchResult.files.length === 0) {
-        await ctx.answerCbQuery('No results with this filter');
-        return;
+        await sendSearchResults(ctx, query, page, filters, true);
+        await ctx.answerCbQuery();
+    } catch (e) {
+        console.error('Apply filter error:', e);
     }
+});
 
-    const keyboard = await generateKeyboard(
-        searchResult.files,
-        query,
-        0,
-        searchResult.hasNext,
-        searchResult.hasPrev,
-        ctx.from.id
-    );
+// Handle Share Page Link
+bot.action(/^s:(.+)$/, async (ctx) => {
+    try {
+        const { page, filters } = deserializeFilters(ctx.match[1]);
+        const query = await extractQuery(ctx);
+        if (!query) return ctx.answerCbQuery('Query Lost.');
 
-    const typeTitle = filterType === 'lang' ? 'Language' : (filterType === 'year' ? 'Year' : 'Quality');
-    await ctx.editMessageText(
-        `🔍 Results for "${query}" (${typeTitle}: ${filterValue})`,
-        keyboard
-    );
-    await ctx.answerCbQuery();
+        const l = filters.file_lang || '-';
+        const y = filters.year || '-';
+        const q = filters.quality || '-';
+        const payload = Buffer.from(`${encodeURIComponent(query)}|${page}|${l}|${y}|${q}`).toString('base64url');
+        const shareLink = `https://t.me/${ctx.botInfo.username}?start=search_${payload}`;
+
+        await ctx.reply(`🔗 *Stateless Filtered Link:*\n\n\`${shareLink}\`\n\n_Anyone with this link can instantly access these exact results!_`, { parse_mode: 'Markdown' });
+        await ctx.answerCbQuery('Link generated!');
+    } catch (e) { }
+});
+
+// Handle getall callback
+bot.action(/^gall:(.+)$/, async (ctx) => {
+    try {
+        const { page, filters } = deserializeFilters(ctx.match[1]);
+        const query = await extractQuery(ctx);
+        if (!query) return ctx.answerCbQuery('Query Lost.');
+
+        const searchResult = await searchFiles(query, page, filters);
+        if (searchResult.files.length === 0) return ctx.answerCbQuery('No files found');
+
+        await ctx.answerCbQuery('Sending files...');
+
+        const sentMessages = [];
+        for (const file of searchResult.files) {
+            const caption = `🎬 *${escapeMarkdown(file.file_name)}*\n\n📦 *Size:* ${formatFileSize(file.file_size)}\n⚠️ _Auto-delete in ${Math.floor(AUTO_DELETE_SECONDS / 60)} minutes_`;
+            try {
+                let sent;
+                if (file.file_type === 'video') {
+                    sent = await ctx.telegram.sendVideo(ctx.from.id, file._id, { caption, parse_mode: 'Markdown' });
+                } else if (file.file_type === 'audio') {
+                    sent = await ctx.telegram.sendAudio(ctx.from.id, file._id, { caption, parse_mode: 'Markdown' });
+                } else {
+                    sent = await ctx.telegram.sendDocument(ctx.from.id, file._id, { caption, parse_mode: 'Markdown' });
+                }
+                sentMessages.push(sent.message_id);
+            } catch (err) { }
+        }
+
+        if (sentMessages.length > 0) {
+            setTimeout(async () => {
+                for (const msgId of sentMessages) {
+                    try { await ctx.telegram.deleteMessage(ctx.from.id, msgId); } catch (e) { }
+                }
+                const delNotify = await ctx.telegram.sendMessage(ctx.from.id, `❌ *Files Deleted!*`, { parse_mode: 'Markdown' });
+                setTimeout(() => ctx.telegram.deleteMessage(ctx.from.id, delNotify.message_id).catch(() => { }), 5000);
+            }, AUTO_DELETE_SECONDS * 1000);
+        }
+    } catch (error) {
+        console.error('Error handling gall:', error);
+    }
 });
 
 // Handle back button
@@ -1311,26 +1696,7 @@ bot.action('delete_cancel', async (ctx) => {
     await ctx.answerCbQuery();
 });
 
-// Handle back button
-bot.action(/^back_(.+)$/, async (ctx) => {
-    const query = ctx.match[1];
-    const searchResult = await searchFiles(query, 0);
-
-    const keyboard = await generateKeyboard(
-        searchResult.files,
-        query,
-        0,
-        searchResult.hasNext,
-        searchResult.hasPrev,
-        ctx.from.id
-    );
-
-    await ctx.editMessageText(
-        `🔍 Found results for "${query}"\nPage 1`,
-        keyboard
-    );
-    await ctx.answerCbQuery();
-});
+// Redundant back handler removed
 
 // Handle indexing confirmation
 bot.action(/^confirm_index_(.+)_(.+)$/, async (ctx) => {
@@ -1411,11 +1777,12 @@ bot.on('channel_post', async (ctx) => {
 
     console.log(`📡 Channel post received from ID: ${chatId}`);
 
-    // 1. Monetization: Track the latest post from Force-Sub Channel
-    if (FSUB_CHANNEL_ID && chatId === FSUB_CHANNEL_ID) {
-        LAST_FSUB_POST_ID = message.message_id;
-        await settingsCollection.updateOne({ key: 'last_fsub_post' }, { $set: { value: LAST_FSUB_POST_ID } }, { upsert: true });
-        console.log(`📈 Monetization updated: Last post ID ${LAST_FSUB_POST_ID} from FSUB channel`);
+    // 1. Monetization: Track the latest post from Monetization Channel
+    const targetMonetizationChannel = MONETIZATION_CHANNEL_ID || FSUB_CHANNEL_ID;
+    if (targetMonetizationChannel && chatId === targetMonetizationChannel) {
+        LAST_MONETIZATION_POST_ID = message.message_id;
+        await settingsCollection.updateOne({ key: 'last_monetization_post' }, { $set: { value: LAST_MONETIZATION_POST_ID } }, { upsert: true });
+        console.log(`📈 Monetization updated: Last post ID ${LAST_MONETIZATION_POST_ID} from target channel`);
     }
 
     // 2. Auto-indexing from Database Channel
@@ -1455,10 +1822,21 @@ bot.on('channel_post', async (ctx) => {
         const media = message.document || message.video || message.audio;
         if (media) {
             const fileId = media.file_id;
-            const file = await filesCollection.findOne({ _id: fileId });
+            const fileRef = media.file_unique_id;
+
+            // Omni-lookup: Check both file_id and file_unique_id against both _id and file_ref
+            // This ensures files from any bot version are matched correctly
+            const file = await filesCollection.findOne({
+                $or: [
+                    { _id: fileId },
+                    { file_ref: fileId },
+                    { _id: fileRef },
+                    { file_ref: fileRef }
+                ]
+            });
 
             if (file) {
-                await filesCollection.deleteOne({ _id: fileId });
+                await filesCollection.deleteOne({ _id: file._id });
                 console.log(`🗑️ Auto-deleted from DB via channel: ${file.file_name}`);
                 await sendLog(
                     `🗑️ *Auto-Deleted from Delete Channel*\n\n` +
@@ -1467,7 +1845,7 @@ bot.on('channel_post', async (ctx) => {
                     `✨ *Status:* Removed from Database`
                 );
             } else {
-                console.log(`⚠️ Delete request ignored: File ${fileId} not found in DB`);
+                console.log(`⚠️ Delete request ignored: File ${fileId} / ${fileRef} not found in DB`);
             }
         }
     }
@@ -1592,48 +1970,7 @@ bot.on('text', async (ctx) => {
 
     try {
         const startTime = Date.now();
-        const searchResult = await searchFiles(message, 0);
-        const endTime = Date.now();
-        const timeTaken = ((endTime - startTime) / 1000).toFixed(2);
-
-        if (searchResult.files.length === 0) {
-            // Only reply to failed searches in PM, or if it's explicitly a command-like text in groups
-            if (ctx.chat.type === 'private' || message.includes('movie') || message.includes('film')) {
-                await ctx.reply(`❌ No results found for "${message}"\n\n💡 Try different keywords or check spelling`,
-                    { reply_to_message_id: ctx.message.message_id, ...await generateKeyboard([], message, 0, false, false, ctx.from.id) });
-            }
-            return;
-        }
-
-        const keyboard = await generateKeyboard(
-            searchResult.files,
-            message,
-            0,
-            searchResult.hasNext,
-            searchResult.hasPrev,
-            ctx.from.id
-        );
-
-        const header = `╭━━━━━━━━━━━━━━━╮\n  👤 *ID:* \`${ctx.from.id}\`\n  ⏱️ *Speed:* \`${timeTaken}s\`\n╰━━━━━━━━━━━━━━━╯\n\n`;
-        const resultText = searchResult.isFuzzy
-            ? `${header}🔍 *Search:* \`${escapeMarkdown(message)}\`\n🔢 *Page:* 1\n\n💡 _Showing closest matches_`
-            : `${header}🔍 *Search:* \`${escapeMarkdown(message)}\`\n🔢 *Page:* 1`;
-
-        const sentMsg = await ctx.reply(resultText, {
-            parse_mode: 'Markdown',
-            reply_to_message_id: ctx.message.message_id,
-            ...keyboard
-        });
-
-        // Group Auto-Cleaner: Delete search result in groups after 5 minutes
-        if (ctx.chat.type !== 'private') {
-            setTimeout(async () => {
-                try {
-                    await ctx.telegram.deleteMessage(ctx.chat.id, sentMsg.message_id);
-                    await ctx.telegram.deleteMessage(ctx.chat.id, ctx.message.message_id); // Delete user's query too
-                } catch (error) { }
-            }, 300 * 1000);
-        }
+        await sendSearchResults(ctx, message, 0, {}, false, startTime);
     } catch (error) {
         console.error('Error handling search:', error);
         await ctx.reply('❌ An error occurred while searching. Please try again.');
