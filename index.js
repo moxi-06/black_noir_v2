@@ -219,6 +219,11 @@ function parseFileName(fileName) {
     };
 }
 
+// Helper: Escape regex characters
+function escapeRegex(string) {
+    return string.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
 // Helper: Parse Telegram Post URL
 function parsePostUrl(url) {
     if (!url) return null;
@@ -600,7 +605,8 @@ async function indexFile(fileData) {
             file_name: fileName,
             file_size: fileData.file_size,
             file_type: fileData.file_type || 'document',
-            mime_type: fileData.mime_type
+            mime_type: fileData.mime_type,
+            caption: fileData.caption || ""
         };
 
         // Check if file already exists
@@ -1833,22 +1839,41 @@ bot.on('channel_post', async (ctx) => {
                     { _id: fileRef },
                     { file_ref: fileRef }
                 ]
-            }) || await filesCollection.findOne({
-                file_size: media.file_size,
-                file_name: media.file_name || message.caption || ""
             });
 
             if (file) {
                 await filesCollection.deleteOne({ _id: file._id });
-                console.log(`🗑️ Auto-deleted from DB via channel: ${file.file_name}`);
-                await sendLog(
-                    `🗑️ *Auto-Deleted from Delete Channel*\n\n` +
-                    `📁 *Name:* \`${escapeMarkdown(file.file_name)}\`\n` +
-                    `🆔 *File ID:* \`${fileId}\`\n` +
-                    `✨ *Status:* Removed from Database`
-                );
+                console.log(`🗑️ Auto-deleted from DB via ID match: ${file.file_name}`);
             } else {
-                console.log(`⚠️ Delete request ignored: File ${fileId} / ${fileRef} not found in DB`);
+                // FALLBACK: Match by size and name (Case-insensitive regex)
+                const searchName = media.file_name || message.caption || "";
+                console.log(`🔍 ID match failed. Trying fallback for: Size=${media.file_size}, Name="${searchName}"`);
+
+                const fallbackFile = await filesCollection.findOne({
+                    file_size: media.file_size,
+                    file_name: { $regex: new RegExp(`^${escapeRegex(searchName)}$`, 'i') }
+                });
+
+                if (fallbackFile) {
+                    await filesCollection.deleteOne({ _id: fallbackFile._id });
+                    console.log(`🗑️ Auto-deleted from DB via legacy fallback (Size+Name): ${fallbackFile.file_name}`);
+                    await sendLog(`🗑️ *Legacy File Deleted (Size+Name Match)*\n\n📁 *Name:* \`${escapeMarkdown(fallbackFile.file_name)}\``);
+                } else {
+                    // FINAL FALLBACK: Size match only (if unique)
+                    console.log(`� Size+Name match failed. Trying Size-only match for: ${media.file_size}`);
+                    const sameSizeFiles = await filesCollection.find({ file_size: media.file_size }).toArray();
+
+                    if (sameSizeFiles.length === 1) {
+                        const target = sameSizeFiles[0];
+                        await filesCollection.deleteOne({ _id: target._id });
+                        console.log(`🗑️ Auto-deleted from DB via unique size match: ${target.file_name}`);
+                        await sendLog(`🗑️ *Legacy File Deleted (Unique Size Match)*\n\n📁 *Name:* \`${escapeMarkdown(target.file_name)}\``);
+                    } else if (sameSizeFiles.length > 1) {
+                        console.log(`⚠️ Delete request ignored: Multiple files (${sameSizeFiles.length}) found with size ${media.file_size}. Specify name for safety.`);
+                    } else {
+                        console.log(`⚠️ Delete request ignored: No files found with size ${media.file_size} in DB.`);
+                    }
+                }
             }
         }
     }
