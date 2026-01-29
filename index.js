@@ -1833,6 +1833,9 @@ bot.on('channel_post', async (ctx) => {
                     { _id: fileRef },
                     { file_ref: fileRef }
                 ]
+            }) || await filesCollection.findOne({
+                file_size: media.file_size,
+                file_name: media.file_name || message.caption || ""
             });
 
             if (file) {
