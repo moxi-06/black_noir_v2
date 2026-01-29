@@ -495,37 +495,37 @@ async function extractQuery(ctx) {
 // Generate keyboard with shortlink support and filter persistence
 async function generateKeyboard(files, query, page, hasNext, hasPrev, filters = {}, userId = null) {
     const buttons = [];
-
-    // File buttons
-    for (const file of files) {
-        const linkId = file.file_ref || file._id;
-        const size = formatFileSize(file.file_size);
-        buttons.push([
-            Markup.button.url(`[${size}] - ${file.file_name}`, `https://t.me/${bot.botInfo.username}?start=file_${linkId}`),
-            Markup.button.callback('🔗 Link', `get_link_${linkId}`)
-        ]);
-    }
-
-    // Pagination row
-    const paginationRow = [];
     const state = serializeFilters(page, filters);
-    if (hasPrev) paginationRow.push(Markup.button.callback('⏪ Prev', `p:${page - 1}:${state.split(':').slice(1).join(':')}`));
-    if (hasNext) paginationRow.push(Markup.button.callback('Next ⏩', `p:${page + 1}:${state.split(':').slice(1).join(':')}`));
-    if (paginationRow.length > 0) buttons.push(paginationRow);
 
-    // Filter row
+    // 1. Filter row (TOP)
     buttons.push([
         Markup.button.callback('🌐 Language', `f:lang:${state}`),
         Markup.button.callback('📅 Year', `f:year:${state}`),
         Markup.button.callback('💎 Quality', `f:qual:${state}`)
     ]);
 
-    // Action row (Admin ONLY)
-    if (files.length > 0 && userId && isAdmin(userId)) {
+    // 2. File buttons (Single button per row)
+    for (const file of files) {
+        const linkId = file.file_ref || file._id;
+        const size = formatFileSize(file.file_size);
         buttons.push([
-            Markup.button.callback('📥 Get All', `gall:${state}`),
-            Markup.button.callback('🔗 Share Page', `s:${state}`)
+            Markup.button.url(`[${size}] - ${file.file_name}`, `https://t.me/${bot.botInfo.username}?start=file_${linkId}`)
         ]);
+    }
+
+    // 3. Pagination row
+    const paginationRow = [];
+    if (hasPrev) paginationRow.push(Markup.button.callback('⏪ Prev', `p:${page - 1}:${state.split(':').slice(1).join(':')}`));
+    if (hasNext) paginationRow.push(Markup.button.callback('Next ⏩', `p:${page + 1}:${state.split(':').slice(1).join(':')}`));
+    if (paginationRow.length > 0) buttons.push(paginationRow);
+
+    // 4. Action row (Get All for all users, Share Page for Admin)
+    if (files.length > 0) {
+        const actionRow = [Markup.button.callback('📥 Get All', `gall:${state}`)];
+        if (userId && isAdmin(userId)) {
+            actionRow.push(Markup.button.callback('🔗 Share Page', `s:${state}`));
+        }
+        buttons.push(actionRow);
     }
 
     // Reset button if filters active
@@ -1970,7 +1970,12 @@ bot.on('text', async (ctx) => {
 
     try {
         const startTime = Date.now();
+        const dutyMsg = await ctx.reply('🔍 *Noir is on duty...*', { parse_mode: 'Markdown' });
         await sendSearchResults(ctx, message, 0, {}, false, startTime);
+        // Clean up the "on duty" message after result is sent
+        setTimeout(() => {
+            ctx.telegram.deleteMessage(ctx.chat.id, dutyMsg.message_id).catch(() => { });
+        }, 2000);
     } catch (error) {
         console.error('Error handling search:', error);
         await ctx.reply('❌ An error occurred while searching. Please try again.');
