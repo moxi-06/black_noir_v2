@@ -228,24 +228,22 @@ function escapeRegex(string) {
 function parsePostUrl(url) {
     if (!url) return null;
     try {
-        // Remove trailing slash and split
         const cleanUrl = url.replace(/\/$/, '');
         const parts = cleanUrl.split('/');
 
         const messageId = parseInt(parts.pop());
-        const chatIdPart = parts.pop();
-
         if (isNaN(messageId)) return null;
 
+        // Check for private channel indicator 'c'
+        // Format: https://t.me/c/12345/678
+        const lastPart = parts.pop();
+        const indicator = parts[parts.length - 1];
+
         let chatId;
-        if (chatIdPart === 'c') {
-            // Private channel link format: https://t.me/c/12345/678
-            chatId = '-100' + parts.pop();
-        } else if (chatIdPart) {
-            // Public channel link format: https://t.me/username/678
-            chatId = chatIdPart.startsWith('@') ? chatIdPart : '@' + chatIdPart;
+        if (indicator === 'c') {
+            chatId = '-100' + lastPart;
         } else {
-            return null;
+            chatId = lastPart.startsWith('@') ? lastPart : '@' + lastPart;
         }
 
         return { chatId, messageId };
@@ -1173,6 +1171,17 @@ bot.command('unpremium', async (ctx) => {
     await ctx.reply(`❌ *User ${uid} premium status removed.*`, { parse_mode: 'Markdown' });
 });
 
+// Set manual ad post ID
+bot.command('setads', async (ctx) => {
+    if (!isAdmin(ctx.from.id)) return;
+    const postId = parseInt(ctx.message.text.split(' ')[1]);
+    if (isNaN(postId)) return ctx.reply('❌ Usage: /setads <post_id>');
+
+    LAST_MONETIZATION_POST_ID = postId;
+    await settingsCollection.updateOne({ key: 'last_monetization_post' }, { $set: { value: LAST_MONETIZATION_POST_ID } }, { upsert: true });
+    await ctx.reply(`✅ *Target Ad Post updated to:* \`${postId}\``, { parse_mode: 'Markdown' });
+});
+
 // Admin Dashboard
 bot.command('admin', async (ctx) => {
     if (!isAdmin(ctx.from.id)) return;
@@ -1229,12 +1238,13 @@ async function triggerAdminRefresh(ctx) {
     const stats = await getDatabaseStats();
     const adminText = `🛠️ *Admin Dashboard*
  
- 🚦 *Maintenance:* ${IS_MAINTENANCE ? '🔴 ON' : '🟢 OFF'}
- 👁️ *Monetization:* ${IS_GROWTH_LOCK ? '🟢 AUTO' : '🔴 DISABLED'}
- 📍 *Tracking:* \`${FSUB_CHANNEL_ID || 'Not Set'}\`
- 📦 *Last Post:* \`${LAST_MONETIZATION_POST_ID || 'Waiting...'}\`
- 🌐 *URL:* \`${process.env.APP_URL || 'Not Set'}\`
- 📡 *Ping:* \`${LAST_PING_STATUS}\`
+  🚦 *Maintenance:* ${IS_MAINTENANCE ? '🔴 ON' : '🟢 OFF'}
+  💰 *Growth Lock:* ${IS_GROWTH_LOCK ? '🟢 AUTO' : '🔴 DISABLED'}
+  📍 *FSUB ID:* \`${FSUB_CHANNEL_ID || 'Not Set'}\`
+  📣 *ADS ID:* \`${MONETIZATION_CHANNEL_ID || 'Not Set'}\`
+  📦 *Last Ad Post:* \`${LAST_MONETIZATION_POST_ID || 'Waiting...'}\`
+  🌐 *URL:* \`${process.env.APP_URL || 'Not Set'}\`
+  📡 *Ping:* \`${LAST_PING_STATUS}\`
 
 📊 *Total Stats:* 
 └ Users: \`${stats.totalUsers}\` 
@@ -1451,8 +1461,12 @@ async function handleDumpBatch(ctx, payload) {
                     setTimeout(() => {
                         ctx.telegram.deleteMessage(ctx.from.id, forwarded.message_id).catch(() => { });
                     }, 300 * 1000); // 5 mins
-                } catch (e) { }
+                } catch (e) {
+                    console.error('Error forwarding batch monetization post:', e.message);
+                }
             }
+        } else if (IS_GROWTH_LOCK) {
+            console.log(`📡 Batch Monetization skipped: CHAN=${!!monetizationChannel}, POST_ID=${!!LAST_MONETIZATION_POST_ID}`);
         }
 
         const sentMessages = [];
@@ -1799,10 +1813,15 @@ bot.on('channel_post', async (ctx) => {
 
     // 1. Monetization: Track the latest post from Monetization Channel
     const targetMonetizationChannel = MONETIZATION_CHANNEL_ID || FSUB_CHANNEL_ID;
-    if (targetMonetizationChannel && chatId === targetMonetizationChannel) {
-        LAST_MONETIZATION_POST_ID = message.message_id;
-        await settingsCollection.updateOne({ key: 'last_monetization_post' }, { $set: { value: LAST_MONETIZATION_POST_ID } }, { upsert: true });
-        console.log(`📈 Monetization updated: Last post ID ${LAST_MONETIZATION_POST_ID} from target channel`);
+
+    if (targetMonetizationChannel) {
+        if (chatId === targetMonetizationChannel) {
+            LAST_MONETIZATION_POST_ID = message.message_id;
+            await settingsCollection.updateOne({ key: 'last_monetization_post' }, { $set: { value: LAST_MONETIZATION_POST_ID } }, { upsert: true });
+            console.log(`📈 Monetization updated: Last post ID ${LAST_MONETIZATION_POST_ID} from target channel ${chatId}`);
+        } else {
+            console.log(`🔔 Channel post ignored for monetization: Active=${targetMonetizationChannel}, Received=${chatId}`);
+        }
     }
 
     // 2. Auto-indexing from Database Channel
