@@ -228,20 +228,29 @@ function escapeRegex(string) {
 function parsePostUrl(url) {
     if (!url) return null;
     try {
-        const parts = url.split('/');
-        const messageId = parseInt(parts.pop());
-        let chatId = parts.pop();
+        // Remove trailing slash and split
+        const cleanUrl = url.replace(/\/$/, '');
+        const parts = cleanUrl.split('/');
 
-        if (chatId === 'c') {
+        const messageId = parseInt(parts.pop());
+        const chatIdPart = parts.pop();
+
+        if (isNaN(messageId)) return null;
+
+        let chatId;
+        if (chatIdPart === 'c') {
             // Private channel link format: https://t.me/c/12345/678
             chatId = '-100' + parts.pop();
-        } else {
+        } else if (chatIdPart) {
             // Public channel link format: https://t.me/username/678
-            chatId = '@' + chatId;
+            chatId = chatIdPart.startsWith('@') ? chatIdPart : '@' + chatIdPart;
+        } else {
+            return null;
         }
 
         return { chatId, messageId };
     } catch (e) {
+        console.error('Error parsing post URL:', e.message);
         return null;
     }
 }
@@ -1056,50 +1065,55 @@ bot.command('broadcast', async (ctx) => {
 
 // Link generator for Dump Channel
 bot.command('link', async (ctx) => {
-    if (!isAdmin(ctx.from.id)) return;
+    try {
+        if (!isAdmin(ctx.from.id)) return;
 
-    const args = ctx.message.text.split(' ').slice(1);
-    if (args.length === 0) {
-        return ctx.reply(`❌ *Usage:* \n\n/link <start_post_url> [<end_post_url>]\n\n_Example:_ \n/link https://t.me/c/12345/100`, { parse_mode: 'Markdown' });
+        const args = ctx.message.text.split(' ').slice(1);
+        if (args.length === 0) {
+            return ctx.reply(`❌ *Usage:* \n\n/link <start_post_url> [<end_post_url>]\n\n_Example:_ \n/link https://t.me/c/12345/100`, { parse_mode: 'Markdown' });
+        }
+
+        const startInfo = parsePostUrl(args[0]);
+        if (!startInfo) {
+            return ctx.reply('❌ Invalid start post URL. Make sure it is a valid Telegram message link.');
+        }
+
+        let endId = startInfo.messageId;
+        if (args[1]) {
+            const endInfo = parsePostUrl(args[1]);
+            if (endInfo) endId = endInfo.messageId;
+        }
+
+        // Ensure range is valid
+        const startId = Math.min(startInfo.messageId, endId);
+        const finalEndId = Math.max(startInfo.messageId, endId);
+
+        if (finalEndId - startId > 100) {
+            return ctx.reply('⚠️ Range too large! Max 100 files per link.');
+        }
+
+        // Encode payload: JSON for robustness
+        const data = JSON.stringify({
+            c: startInfo.chatId,
+            s: startId,
+            e: finalEndId
+        });
+        const payload = Buffer.from(data).toString('base64url');
+        const shareLink = `https://t.me/${ctx.botInfo.username}?start=get_${payload}`;
+
+        const count = (finalEndId - startId) + 1;
+        await ctx.reply(
+            `🔗 *Permanent File Store Link*\n\n` +
+            `📦 *Files:* \`${count}\`\n` +
+            `📍 *Ref:* \`${startInfo.chatId}\`\n\n` +
+            `\`${shareLink}\`\n\n` +
+            `_Anyone with this link can instantly receive these files!_`,
+            { parse_mode: 'Markdown' }
+        );
+    } catch (error) {
+        console.error('Error in /link command:', error);
+        await ctx.reply('❌ An error occurred while generating the link. Please try again.');
     }
-
-    const startInfo = parsePostUrl(args[0]);
-    if (!startInfo) {
-        return ctx.reply('❌ Invalid start post URL. Make sure it is a valid Telegram message link.');
-    }
-
-    let endId = startInfo.messageId;
-    if (args[1]) {
-        const endInfo = parsePostUrl(args[1]);
-        if (endInfo) endId = endInfo.messageId;
-    }
-
-    // Ensure range is valid
-    const startId = Math.min(startInfo.messageId, endId);
-    const finalEndId = Math.max(startInfo.messageId, endId);
-
-    if (finalEndId - startId > 100) {
-        return ctx.reply('⚠️ Range too large! Max 100 files per link.');
-    }
-
-    // Encode payload: JSON for robustness
-    const data = JSON.stringify({
-        c: startInfo.chatId,
-        s: startId,
-        e: finalEndId
-    });
-    const payload = Buffer.from(data).toString('base64url');
-    const shareLink = `https://t.me/${ctx.botInfo.username}?start=get_${payload}`;
-
-    const count = (finalEndId - startId) + 1;
-    await ctx.reply(
-        `🔗 *Permanent File Store Link*\n\n` +
-        `📦 *Files:* \`${count}\`\n` +
-        `📍 *Ref:* \`${cleanChatId}\`\n\n` +
-        `\`${shareLink}\`\n\n` +
-        `_Anyone with this link can instantly receive these files!_`,
-        { parse_mode: 'Markdown' }
-    );
 });
 
 // Block Keyword
