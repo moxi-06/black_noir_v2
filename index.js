@@ -744,25 +744,14 @@ bot.action('check_sub', async (ctx) => {
 
 // Helper: Show Home/Welcome Menu
 async function showWelcome(ctx) {
-    const welcomeText = `🎬 *Noir Premium Filter Bot* 🍿
-
-🚀 *The fastest way to find movies!*
-
-✨ *Features:*
-└ 🔍 AI Smart Search
-└ 🗣️ Multi-Language Support
-└ 💎 HD Quality Filters
-└ 🤝 Referral Program
-
-🔥 *Trending Right Now:*
-${await getTrendingText()}
-
-💡 *Just type a movie name below to start!*`;
+    const welcomeText = `🎬 *Noir Premium Filter Bot* 🍿\n\n` +
+        `🚀 *The fastest way to find movies!*\n\n` +
+        `💡 *Just type a movie name below to start!*`;
 
     const keyboard = Markup.inlineKeyboard([
-        [Markup.button.callback('🔥 Trending', 'show_trending')],
-        [Markup.button.callback('🤝 Refer & Earn', 'show_refer')],
-        [Markup.button.callback('📊 Stats', 'show_stats'), Markup.button.callback('❓ Help', 'show_help')]
+        [Markup.button.callback('🔥 Trending Movies', 'show_trending')],
+        [Markup.button.callback('🤝 Refer & Earn', 'show_refer'), Markup.button.callback('📊 Stats', 'show_stats')],
+        [Markup.button.callback('❓ Help', 'show_help')]
     ]);
 
     if (ctx.updateType === 'callback_query') {
@@ -895,15 +884,21 @@ async function sendFile(ctx, fileId) {
 // Handle new group members (Auto-Welcome)
 bot.on('new_chat_members', async (ctx) => {
     const chatTitle = ctx.chat.title;
-    const userNames = ctx.message.new_chat_members.map(m => m.first_name).join(', ');
+    const members = ctx.message.new_chat_members;
+
+    // Create mentions for all new members
+    const mentions = members.map(m => `[${m.first_name}](tg://user?id=${m.id})`).join(', ');
 
     const welcomeMsg = `🎬 *Welcome to ${chatTitle}!* 🍿\n\n` +
-        `Hello ${userNames}! 🥤\n\n` +
+        `Hello ${mentions}! 🥤\n\n` +
         `🚀 *How to find movies?*\n` +
         `Just type the movie name in this group or start me in PM!\n\n` +
         `Powered by Noir Advanced Indexer`;
 
-    await ctx.reply(welcomeMsg, { parse_mode: 'Markdown' });
+    await ctx.reply(welcomeMsg, {
+        parse_mode: 'Markdown',
+        reply_to_message_id: ctx.message.message_id
+    });
 });
 
 async function getTrendingText() {
@@ -2015,11 +2010,14 @@ bot.on('text', async (ctx) => {
             [Markup.button.callback('✅ I Have Joined', 'check_sub')]
         ]);
 
+        const mention = `[${ctx.from.first_name}](tg://user?id=${ctx.from.id})`;
+        const groupReply = ctx.chat.type !== 'private' ? { reply_to_message_id: ctx.message.message_id } : {};
+
         await ctx.reply(
-            `❌ *Access Denied!*\n\n` +
+            `❌ *Access Denied ${mention}!*\n\n` +
             `You must join our channel to use this bot.\n\n` +
             `Please join and click the button below:`,
-            { parse_mode: 'Markdown', ...keyboard }
+            { parse_mode: 'Markdown', ...keyboard, ...groupReply }
         );
         return;
     }
@@ -2031,7 +2029,8 @@ bot.on('text', async (ctx) => {
 
     try {
         const startTime = Date.now();
-        const dutyMsg = await ctx.reply('🔍 *Noir is on duty...*', { parse_mode: 'Markdown' });
+        const groupReply = ctx.chat.type !== 'private' ? { reply_to_message_id: ctx.message.message_id } : {};
+        const dutyMsg = await ctx.reply('🔍 *Noir is on duty...*', { parse_mode: 'Markdown', ...groupReply });
         await sendSearchResults(ctx, message, 0, {}, false, startTime);
         // Clean up the "on duty" message after result is sent
         setTimeout(() => {
