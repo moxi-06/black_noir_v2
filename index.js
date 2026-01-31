@@ -48,7 +48,19 @@ const AUTO_DELETE_SECONDS = 3600;
 const BOT_START_TIME = Date.now();
 
 // Store pending indexing operations
+// Store pending indexing operations and web search cache
 const pendingIndexing = new Map();
+const webSearchCache = new Map();
+
+// Periodic cleanup of web search cache (every 15 mins)
+setInterval(() => {
+    const now = Date.now();
+    for (const [id, data] of webSearchCache.entries()) {
+        if (now - data.timestamp > 30 * 60 * 1000) { // 30 mins expiry
+            webSearchCache.delete(id);
+        }
+    }
+}, 15 * 60 * 1000);
 
 // 📡 Immediate Health Check Server (Critical for Koyeb)
 const http = require('http');
@@ -732,6 +744,58 @@ bot.command('me', async (ctx) => {
     await ctx.reply(profileText, { parse_mode: 'Markdown' });
 });
 
+// Helper: Send Paginated Web Search Results
+async function sendWebResults(ctx, searchId, page, isEdit = false) {
+    const data = webSearchCache.get(searchId);
+    if (!data) {
+        if (isEdit) return ctx.answerCbQuery('❌ Results expired. Please search again.', { show_alert: true });
+        return;
+    }
+
+    const { query, results, timestamp } = data;
+    const itemsPerPage = 1; // Show 1 topic per page to avoid limit issues
+    const totalPages = results.length;
+
+    if (page < 0 || page >= totalPages) return;
+
+    const topic = results[page];
+    const safeTitle = topic.title.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+
+    let text = `🌐 <b>Web Search Results for:</b> <code>${query}</code>\n` +
+        `🔢 <b>Topic ${page + 1} of ${totalPages}</b>\n━━━━━━━━━━━━━━━\n\n` +
+        `🎬 <b>${safeTitle}</b>\n\n`;
+
+    topic.links.forEach(link => {
+        const icon = link.type === 'Magnet' ? '🧲' : (link.type === 'GDrive' ? '☁️' : '🔗');
+        const safeLabel = link.label.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+        text += `${icon} <b>${safeLabel}:</b>\n<code>${link.url}</code>\n\n`;
+    });
+
+    text += `━━━━━━━━━━━━━━━\n` +
+        `💡 <i>Direct links might require following the site's shortner.</i>`;
+
+    const buttons = [];
+    const navRow = [];
+    if (page > 0) navRow.push(Markup.button.callback('⏪ Previous', `wsrp:${searchId}:${page - 1}`));
+    if (page < totalPages - 1) navRow.push(Markup.button.callback('Next ⏩', `wsrp:${searchId}:${page + 1}`));
+    if (navRow.length > 0) buttons.push(navRow);
+    buttons.push([Markup.button.callback('🗑️ Close', 'close_search')]);
+
+    const keyboard = Markup.inlineKeyboard(buttons);
+
+    if (isEdit) {
+        try {
+            await ctx.editMessageText(text, { parse_mode: 'HTML', disable_web_page_preview: true, ...keyboard });
+        } catch (e) {
+            if (!e.message.includes('message is not modified')) {
+                console.error('Error editing web results:', e);
+            }
+        }
+    } else {
+        await ctx.reply(text, { parse_mode: 'HTML', disable_web_page_preview: true, ...keyboard });
+    }
+}
+
 // Handle /search command (Web Scraping)
 bot.command('search', async (ctx) => {
     if (!await checkUser(ctx)) return;
@@ -745,54 +809,23 @@ bot.command('search', async (ctx) => {
 
     try {
         const results = await searchWebsite(query);
-        
+
         if (results.length === 0) {
             await ctx.telegram.editMessageText(ctx.chat.id, findingMsg.message_id, null, `❌ <b>No links found for:</b> <code>${query}</code>\n\nTry a different name or be more specific.`, { parse_mode: 'HTML' });
             return;
         }
 
-        const chunks = [];
-        let currentChunk = `🌐 <b>Web Search Results for:</b> <code>${query}</code>\n━━━━━━━━━━━━━━━\n\n`;
-        
-        for (const topic of results) {
-            const safeTitle = topic.title.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
-            let topicText = `🎬 <b>${safeTitle}</b>\n`;
-            
-            topic.links.forEach(link => {
-                const icon = link.type === 'Magnet' ? '🧲' : (link.type === 'GDrive' ? '☁️' : '🔗');
-                const safeLabel = link.label.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
-                topicText += `${icon} <b>${safeLabel}:</b>\n<code>${link.url}</code>\n\n`;
-            });
-            topicText += `━━━━━━━━━━━━━━━\n\n`;
+        const searchId = `ws_${Date.now()}_${ctx.from.id}`;
+        webSearchCache.set(searchId, {
+            query,
+            results,
+            timestamp: Date.now()
+        });
 
-            if ((currentChunk.length + topicText.length) > 3800) {
-                chunks.push(currentChunk);
-                currentChunk = topicText;
-            } else {
-                currentChunk += topicText;
-            }
-        }
-        
-        currentChunk += `💡 <i>Direct links might require following the site's shortner.</i>`;
-        chunks.push(currentChunk);
+        // Delete the "Searching..." message and send first result
+        await ctx.telegram.deleteMessage(ctx.chat.id, findingMsg.message_id).catch(() => { });
+        await sendWebResults(ctx, searchId, 0);
 
-        for (let i = 0; i < chunks.length; i++) {
-            try {
-                if (i === 0) {
-                    await ctx.telegram.editMessageText(ctx.chat.id, findingMsg.message_id, null, chunks[i], { parse_mode: 'HTML', disable_web_page_preview: true });
-                } else {
-                    await ctx.reply(chunks[i], { parse_mode: 'HTML', disable_web_page_preview: true });
-                }
-            } catch (err) {
-                console.error(`Error sending message part ${i}:`, err);
-                if (err.description && err.description.includes('MESSAGE_TOO_LONG')) {
-                    const fallback = chunks[i].substring(0, 3500) + '... (truncated due to length)';
-                    if (i === 0) await ctx.telegram.editMessageText(ctx.chat.id, findingMsg.message_id, null, fallback, { parse_mode: 'HTML' });
-                    else await ctx.reply(fallback, { parse_mode: 'HTML' });
-                }
-            }
-        }
-        
     } catch (error) {
         console.error('Bot Search command error:', error);
         try {
@@ -801,6 +834,21 @@ bot.command('search', async (ctx) => {
             await ctx.reply('❌ <b>An error occurred during web search.</b>', { parse_mode: 'HTML' });
         }
     }
+});
+
+// Handle Web Search Pagination
+bot.action(/^wsrp:(.+):(\d+)$/, async (ctx) => {
+    const searchId = ctx.match[1];
+    const page = parseInt(ctx.match[2]);
+    await sendWebResults(ctx, searchId, page, true);
+    await ctx.answerCbQuery().catch(() => { });
+});
+
+bot.action('close_search', async (ctx) => {
+    try {
+        await ctx.deleteMessage();
+    } catch (e) { }
+    await ctx.answerCbQuery('Closed!').catch(() => { });
 });
 
 // Handle check_sub action
