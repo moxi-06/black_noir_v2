@@ -30,8 +30,8 @@ async function searchWebsite(query) {
 
         if (topics.length === 0) return [];
 
-        // Limit to top 3 topics to avoid excessive requests
-        const topTopics = topics.slice(0, 3);
+        // Limit to top 10 topics for better search coverage
+        const topTopics = topics.slice(0, 10);
         const results = [];
 
         for (const topic of topTopics) {
@@ -61,7 +61,7 @@ async function searchWebsite(query) {
                 if (links.length > 0) {
                     results.push({
                         title: topic.title,
-                        links: links.slice(0, 10) // Limit links per topic
+                        links: links.slice(0, 15) // Limit links per topic
                     });
                 }
             } catch (err) {
