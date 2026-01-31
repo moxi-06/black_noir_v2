@@ -747,24 +747,29 @@ bot.command('search', async (ctx) => {
         const results = await searchWebsite(query);
 
         if (results.length === 0) {
-            await ctx.telegram.editMessageText(ctx.chat.id, findingMsg.message_id, null, `❌ *No links found for:* \`${query}\`\n\nTry a different name or be more specific.`, { parse_mode: 'Markdown' });
+            await ctx.telegram.editMessageText(ctx.chat.id, findingMsg.message_id, null, `❌ <b>No links found for:</b> <code>${query}</code>\n\nTry a different name or be more specific.`, { parse_mode: 'HTML' });
             return;
         }
 
-        let response = `🌐 *Web Search Results for:* \`${query}\`\n━━━━━━━━━━━━━━━\n\n`;
+        let response = `🌐 <b>Web Search Results for:</b> <code>${query}</code>\n━━━━━━━━━━━━━━━\n\n`;
 
         for (const topic of results) {
-            response += `🎬 *${topic.title}*\n`;
+            // Escape title for HTML
+            const safeTitle = topic.title.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+            response += `🎬 <b>${safeTitle}</b>\n`;
+
             topic.links.forEach(link => {
                 const icon = link.type === 'Magnet' ? '🧲' : (link.type === 'GDrive' ? '☁️' : '🔗');
-                response += `${icon} [${link.label}](${link.url})\n`;
+                // Escape label for HTML
+                const safeLabel = link.label.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+                response += `${icon} <a href="${link.url}">${safeLabel}</a>\n`;
             });
             response += `━━━━━━━━━━━━━━━\n\n`;
         }
 
-        response += `💡 _Direct links might require following the site's shortner._`;
+        response += `💡 <i>Direct links might require following the site's shortner.</i>`;
 
-        await ctx.telegram.editMessageText(ctx.chat.id, findingMsg.message_id, null, response, { parse_mode: 'Markdown', disable_web_page_preview: true });
+        await ctx.telegram.editMessageText(ctx.chat.id, findingMsg.message_id, null, response, { parse_mode: 'HTML', disable_web_page_preview: true });
 
     } catch (error) {
         console.error('Bot Search command error:', error);
