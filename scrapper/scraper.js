@@ -61,7 +61,7 @@ async function searchWebsite(query) {
                 if (links.length > 0) {
                     results.push({
                         title: topic.title,
-                        links: links.slice(0, 15) // Limit links per topic
+                        links: links.slice(0, 6) // Limit links per topic for better usability
                     });
                 }
             } catch (err) {
