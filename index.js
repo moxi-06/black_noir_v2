@@ -2,6 +2,7 @@ require('dotenv').config();
 const { Telegraf, Markup } = require('telegraf');
 const { MongoClient } = require('mongodb');
 const Fuse = require('fuse.js');
+const { searchWebsite } = require('./scrapper/scraper');
 
 // Configuration
 const BOT_TOKEN = process.env.BOT_TOKEN;
@@ -729,6 +730,46 @@ bot.command('me', async (ctx) => {
 🚀 _Share your link to grow your rank!_`;
 
     await ctx.reply(profileText, { parse_mode: 'Markdown' });
+});
+
+// Handle /search command (Web Scraping)
+bot.command('search', async (ctx) => {
+    if (!await checkUser(ctx)) return;
+
+    const query = ctx.message.text.split(' ').slice(1).join(' ');
+    if (!query) {
+        return ctx.reply('⚠️ *Search Query Missing*\n\nUsage: `/search movie_name`', { parse_mode: 'Markdown' });
+    }
+
+    const findingMsg = await ctx.reply(`🔍 *Searching for* \`${query}\` *on web...*`, { parse_mode: 'Markdown' });
+
+    try {
+        const results = await searchWebsite(query);
+
+        if (results.length === 0) {
+            await ctx.telegram.editMessageText(ctx.chat.id, findingMsg.message_id, null, `❌ *No links found for:* \`${query}\`\n\nTry a different name or be more specific.`, { parse_mode: 'Markdown' });
+            return;
+        }
+
+        let response = `🌐 *Web Search Results for:* \`${query}\`\n━━━━━━━━━━━━━━━\n\n`;
+
+        for (const topic of results) {
+            response += `🎬 *${topic.title}*\n`;
+            topic.links.forEach(link => {
+                const icon = link.type === 'Magnet' ? '🧲' : (link.type === 'GDrive' ? '☁️' : '🔗');
+                response += `${icon} [${link.label}](${link.url})\n`;
+            });
+            response += `━━━━━━━━━━━━━━━\n\n`;
+        }
+
+        response += `💡 _Direct links might require following the site's shortner._`;
+
+        await ctx.telegram.editMessageText(ctx.chat.id, findingMsg.message_id, null, response, { parse_mode: 'Markdown', disable_web_page_preview: true });
+
+    } catch (error) {
+        console.error('Bot Search command error:', error);
+        await ctx.telegram.editMessageText(ctx.chat.id, findingMsg.message_id, null, '❌ *An error occurred during web search.*');
+    }
 });
 
 // Handle check_sub action
