@@ -745,35 +745,61 @@ bot.command('search', async (ctx) => {
 
     try {
         const results = await searchWebsite(query);
-
+        
         if (results.length === 0) {
             await ctx.telegram.editMessageText(ctx.chat.id, findingMsg.message_id, null, `❌ <b>No links found for:</b> <code>${query}</code>\n\nTry a different name or be more specific.`, { parse_mode: 'HTML' });
             return;
         }
 
-        let response = `🌐 <b>Web Search Results for:</b> <code>${query}</code>\n━━━━━━━━━━━━━━━\n\n`;
-
+        const chunks = [];
+        let currentChunk = `🌐 <b>Web Search Results for:</b> <code>${query}</code>\n━━━━━━━━━━━━━━━\n\n`;
+        
         for (const topic of results) {
-            // Escape title for HTML
             const safeTitle = topic.title.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
-            response += `🎬 <b>${safeTitle}</b>\n`;
-
+            let topicText = `🎬 <b>${safeTitle}</b>\n`;
+            
             topic.links.forEach(link => {
                 const icon = link.type === 'Magnet' ? '🧲' : (link.type === 'GDrive' ? '☁️' : '🔗');
-                // Escape label for HTML
                 const safeLabel = link.label.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
-                response += `${icon} <b>${safeLabel}:</b>\n<code>${link.url}</code>\n\n`;
+                topicText += `${icon} <b>${safeLabel}:</b>\n<code>${link.url}</code>\n\n`;
             });
-            response += `━━━━━━━━━━━━━━━\n\n`;
+            topicText += `━━━━━━━━━━━━━━━\n\n`;
+
+            if ((currentChunk.length + topicText.length) > 3800) {
+                chunks.push(currentChunk);
+                currentChunk = topicText;
+            } else {
+                currentChunk += topicText;
+            }
         }
+        
+        currentChunk += `💡 <i>Direct links might require following the site's shortner.</i>`;
+        chunks.push(currentChunk);
 
-        response += `💡 <i>Direct links might require following the site's shortner.</i>`;
-
-        await ctx.telegram.editMessageText(ctx.chat.id, findingMsg.message_id, null, response, { parse_mode: 'HTML', disable_web_page_preview: true });
-
+        for (let i = 0; i < chunks.length; i++) {
+            try {
+                if (i === 0) {
+                    await ctx.telegram.editMessageText(ctx.chat.id, findingMsg.message_id, null, chunks[i], { parse_mode: 'HTML', disable_web_page_preview: true });
+                } else {
+                    await ctx.reply(chunks[i], { parse_mode: 'HTML', disable_web_page_preview: true });
+                }
+            } catch (err) {
+                console.error(`Error sending message part ${i}:`, err);
+                if (err.description && err.description.includes('MESSAGE_TOO_LONG')) {
+                    const fallback = chunks[i].substring(0, 3500) + '... (truncated due to length)';
+                    if (i === 0) await ctx.telegram.editMessageText(ctx.chat.id, findingMsg.message_id, null, fallback, { parse_mode: 'HTML' });
+                    else await ctx.reply(fallback, { parse_mode: 'HTML' });
+                }
+            }
+        }
+        
     } catch (error) {
         console.error('Bot Search command error:', error);
-        await ctx.telegram.editMessageText(ctx.chat.id, findingMsg.message_id, null, '❌ *An error occurred during web search.*');
+        try {
+            await ctx.telegram.editMessageText(ctx.chat.id, findingMsg.message_id, null, '❌ <b>An error occurred during web search.</b>', { parse_mode: 'HTML' });
+        } catch (e) {
+            await ctx.reply('❌ <b>An error occurred during web search.</b>', { parse_mode: 'HTML' });
+        }
     }
 });
 
