@@ -762,7 +762,7 @@ bot.command('search', async (ctx) => {
                 const icon = link.type === 'Magnet' ? '🧲' : (link.type === 'GDrive' ? '☁️' : '🔗');
                 // Escape label for HTML
                 const safeLabel = link.label.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
-                response += `${icon} <a href="${link.url}">${safeLabel}</a>\n`;
+                response += `${icon} <b>${safeLabel}:</b>\n<code>${link.url}</code>\n\n`;
             });
             response += `━━━━━━━━━━━━━━━\n\n`;
         }
