@@ -753,19 +753,35 @@ async function sendWebResults(ctx, searchId, page, isEdit = false) {
     }
 
     const { query, results, timestamp } = data;
-    const itemsPerPage = 1; // Show 1 topic per page to avoid limit issues
-    const totalPages = results.length;
+
+    // Flatten links across all topics
+    const flatLinks = [];
+    results.forEach(topic => {
+        topic.links.forEach(link => {
+            flatLinks.push({ topicTitle: topic.title, ...link });
+        });
+    });
+
+    const itemsPerPage = 3; // 3 links per page is safe even for long magnet links
+    const totalPages = Math.ceil(flatLinks.length / itemsPerPage);
 
     if (page < 0 || page >= totalPages) return;
 
-    const topic = results[page];
-    const safeTitle = topic.title.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+    const start = page * itemsPerPage;
+    const end = start + itemsPerPage;
+    const currentLinks = flatLinks.slice(start, end);
 
     let text = `🌐 <b>Web Search Results for:</b> <code>${query}</code>\n` +
-        `🔢 <b>Topic ${page + 1} of ${totalPages}</b>\n━━━━━━━━━━━━━━━\n\n` +
-        `🎬 <b>${safeTitle}</b>\n\n`;
+        `🔢 <b>Page ${page + 1} of ${totalPages}</b>\n━━━━━━━━━━━━━━━\n\n`;
 
-    topic.links.forEach(link => {
+    let lastTopic = "";
+    currentLinks.forEach(link => {
+        if (link.topicTitle !== lastTopic) {
+            const safeTitle = link.topicTitle.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+            text += `🎬 <b>${safeTitle}</b>\n`;
+            lastTopic = link.topicTitle;
+        }
+
         const icon = link.type === 'Magnet' ? '🧲' : (link.type === 'GDrive' ? '☁️' : '🔗');
         const safeLabel = link.label.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
         text += `${icon} <b>${safeLabel}:</b>\n<code>${link.url}</code>\n\n`;
