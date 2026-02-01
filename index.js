@@ -618,8 +618,19 @@ async function sendSearchResults(ctx, query, page, filters = {}, isEdit = false,
         if (ctx.chat.type === 'private' || query.includes('movie') || query.includes('film')) {
             await ctx.reply(`❌ No results found for "${query}"\n\n💡 Try different keywords or check spelling`, { reply_to_message_id: ctx.message?.message_id });
         }
-        return;
     }
+
+    // Log search query (only for new searches, not pagination edits)
+    if (!isEdit) {
+        await sendLog(
+            `🔍 *New Search Query*\n\n` +
+            `👤 *User:* ${ctx.from.first_name} (\`${ctx.from.id}\`)\n` +
+            `🔎 *Query:* \`${query}\`\n` +
+            `📦 *Results:* \`${searchResult.files.length}\``
+        );
+    }
+
+    if (searchResult.files.length === 0 && !isEdit) return;
 
     let sentMsg;
     if (isEdit) {
@@ -1046,6 +1057,14 @@ async function sendFile(ctx, fileId) {
         } else {
             sentMsg = await ctx.replyWithDocument(file._id, { caption, ...keyboard, parse_mode: 'Markdown' });
         }
+
+        // Log file delivery
+        await sendLog(
+            `📤 *File Delivered*\n\n` +
+            `👤 *User:* ${ctx.from.first_name} (\`${ctx.from.id}\`)\n` +
+            `📁 *File:* \`${file.file_name}\`\n` +
+            `💾 *Size:* ${formatFileSize(file.file_size)}`
+        );
 
         setTimeout(async () => {
             try {
