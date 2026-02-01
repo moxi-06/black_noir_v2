@@ -42,7 +42,8 @@ const YEARS = [];
 for (let y = new Date().getFullYear(); y >= 2000; y--) YEARS.push(y.toString());
 
 const RESULTS_PER_PAGE = 10;
-const AUTO_DELETE_SECONDS = 3600;
+const AUTO_DELETE_SECONDS = 3600; // 60 minutes for files
+const SEARCH_DELETE_SECONDS = 120; // 2 minutes for search results
 
 // Bot start time for uptime tracking
 const BOT_START_TIME = Date.now();
@@ -51,6 +52,19 @@ const BOT_START_TIME = Date.now();
 // Store pending indexing operations and web search cache
 const pendingIndexing = new Map();
 const webSearchCache = new Map();
+
+// Broadcast State
+let broadcastState = {
+    isActive: false,
+    total: 0,
+    current: 0,
+    success: 0,
+    failed: 0,
+    startTime: null,
+    cancelRequested: false,
+    messageId: null,
+    chatId: null
+};
 
 // Periodic cleanup of web search cache (every 15 mins)
 setInterval(() => {
@@ -321,14 +335,23 @@ async function saveUser(user, referredBy = null) {
         if (!existingUser) {
             updateDoc.$set.joined_at = new Date();
             updateDoc.$set.referrals = 0;
+
+            // Log new user
+            let logMsg = `🆕 #NewUser\n\n` +
+                `👤 *Name:* ${user.first_name}\n` +
+                `🆔 *ID:* \`${user.id}\`\n`;
+            if (user.username) logMsg += `🎭 *Username:* @${user.username}\n`;
+
             if (referredBy && referredBy !== user.id) {
                 updateDoc.$set.referred_by = referredBy;
+                logMsg += `🔗 *Referred By:* \`${referredBy}\`\n`;
                 // Increment referral count for the referrer
                 await usersCollection.updateOne(
                     { user_id: referredBy },
                     { $inc: { referrals: 1 } }
                 );
             }
+            await sendLog(logMsg);
         }
 
         await usersCollection.updateOne(
@@ -598,18 +621,40 @@ async function sendSearchResults(ctx, query, page, filters = {}, isEdit = false,
         return;
     }
 
+    let sentMsg;
     if (isEdit) {
         try {
             await ctx.editMessageText(text, { parse_mode: 'Markdown', ...keyboard });
+            sentMsg = ctx.update.callback_query.message;
         } catch (e) {
             // Message might be same or other error
         }
     } else {
-        await ctx.reply(text, {
+        sentMsg = await ctx.reply(text, {
             parse_mode: 'Markdown',
             reply_to_message_id: ctx.message.message_id,
             ...keyboard
         });
+    }
+
+    // Auto-delete search results after 2 minutes (PM and Groups)
+    if (sentMsg) {
+        setTimeout(async () => {
+            try {
+                // Delete bot's message
+                await ctx.telegram.deleteMessage(ctx.chat.id, sentMsg.message_id);
+                // Delete user's query message if possible
+                if (ctx.message) {
+                    await ctx.telegram.deleteMessage(ctx.chat.id, ctx.message.message_id).catch(() => { });
+                }
+
+                // Send temporary notification
+                const delMsg = await ctx.reply(`❌ *Search results cleared to keep the chat clean.*`, { parse_mode: 'Markdown' });
+                setTimeout(() => {
+                    ctx.telegram.deleteMessage(ctx.chat.id, delMsg.message_id).catch(() => { });
+                }, 10000);
+            } catch (e) { }
+        }, SEARCH_DELETE_SECONDS * 1000);
     }
 }
 
@@ -1004,7 +1049,14 @@ async function sendFile(ctx, fileId) {
 
         setTimeout(async () => {
             try {
+                // Delete the file message
                 await ctx.telegram.deleteMessage(ctx.chat.id, sentMsg.message_id);
+
+                // Delete the /start command message that triggered this
+                if (ctx.message) {
+                    await ctx.telegram.deleteMessage(ctx.chat.id, ctx.message.message_id).catch(() => { });
+                }
+
                 const delMsg = await ctx.reply(`❌ *File Deleted!* \n\nFiles are removed to keep our server fast. \n\n_Just search again if you missed it!_`, { parse_mode: 'Markdown' });
                 // Clean up the "File Deleted" message after 10 seconds
                 setTimeout(() => {
@@ -1161,35 +1213,112 @@ bot.action(/^req_(.+)$/, async (ctx) => {
 bot.command('broadcast', async (ctx) => {
     if (!isAdmin(ctx.from.id)) return;
 
+    if (broadcastState.isActive) {
+        return ctx.reply('⚠️ *Broadcast already in progress!* \n\nUse `/broadcast_status` to check progress or `/broadcast_cancel` to stop it.', { parse_mode: 'Markdown' });
+    }
+
     const message = ctx.message.reply_to_message;
     if (!message) {
         return ctx.reply('❌ Reply to a message to broadcast it.');
     }
 
-    const m = await ctx.reply('⏳ Broadcasting message...');
     const users = await usersCollection.find({}).toArray();
-    let success = 0;
-    let failed = 0;
+    if (users.length === 0) return ctx.reply('❌ No users found in database.');
 
-    for (const user of users) {
-        try {
-            await ctx.telegram.copyMessage(user.user_id, ctx.chat.id, message.message_id);
-            success++;
-        } catch (error) {
-            failed++;
+    // Reset state
+    broadcastState = {
+        isActive: true,
+        total: users.length,
+        current: 0,
+        success: 0,
+        failed: 0,
+        startTime: Date.now(),
+        cancelRequested: false,
+        messageId: message.message_id,
+        chatId: ctx.chat.id
+    };
+
+    const statusMsg = await ctx.reply(`⏳ *Starting Broadcast...*\n\n👥 *Target Users:* \`${users.length}\``, { parse_mode: 'Markdown' });
+
+    // Run in background
+    (async () => {
+        for (const user of users) {
+            if (broadcastState.cancelRequested) break;
+
+            try {
+                await ctx.telegram.copyMessage(user.user_id, broadcastState.chatId, broadcastState.messageId);
+                broadcastState.success++;
+            } catch (error) {
+                broadcastState.failed++;
+            }
+            broadcastState.current++;
+
+            // Rate limit: ~20-30 msgs/sec is safe for Telegram
+            await new Promise(r => setTimeout(r, 50));
+
+            // Update status every 50 users
+            if (broadcastState.current % 50 === 0) {
+                const progress = ((broadcastState.current / broadcastState.total) * 100).toFixed(1);
+                await ctx.telegram.editMessageText(
+                    ctx.chat.id,
+                    statusMsg.message_id,
+                    null,
+                    `⏳ *Broadcasting...*\n\n` +
+                    `📊 *Progress:* ${progress}%\n` +
+                    `✅ *Success:* \`${broadcastState.success}\`\n` +
+                    `❌ *Failed:* \`${broadcastState.failed}\`\n` +
+                    `👥 *Current:* \`${broadcastState.current}\` / \`${broadcastState.total}\`\n\n` +
+                    `_Use /broadcast_status for live updates!_`,
+                    { parse_mode: 'Markdown' }
+                ).catch(() => { });
+            }
         }
-    }
 
-    await ctx.telegram.editMessageText(
-        ctx.chat.id,
-        m.message_id,
-        null,
-        `✅ *Broadcast Complete*\n\n` +
-        `👤 *Total Users:* ${users.length}\n` +
-        `✅ *Success:* ${success}\n` +
-        `❌ *Failed:* ${failed}`,
+        const duration = ((Date.now() - broadcastState.startTime) / 1000).toFixed(1);
+        const finalStatus = broadcastState.cancelRequested ? '🛑 *Broadcast Cancelled*' : '✅ *Broadcast Complete*';
+
+        await ctx.telegram.editMessageText(
+            ctx.chat.id,
+            statusMsg.message_id,
+            null,
+            `${finalStatus}\n\n` +
+            `⏱️ *Time Taken:* \`${duration}s\`\n` +
+            `✅ *Success:* \`${broadcastState.success}\`\n` +
+            `❌ *Failed:* \`${broadcastState.failed}\`\n` +
+            `👥 *Total:* \`${broadcastState.current}\``,
+            { parse_mode: 'Markdown' }
+        ).catch(() => { });
+
+        broadcastState.isActive = false;
+    })();
+});
+
+// Broadcast status
+bot.command('broadcast_status', async (ctx) => {
+    if (!isAdmin(ctx.from.id)) return;
+    if (!broadcastState.isActive) return ctx.reply('ℹ️ No active broadcast at the moment.');
+
+    const progress = ((broadcastState.current / broadcastState.total) * 100).toFixed(1);
+    const duration = ((Date.now() - broadcastState.startTime) / 1000).toFixed(1);
+
+    await ctx.reply(
+        `📊 *Broadcast Live Status*\n\n` +
+        `⏳ *Progress:* ${progress}%\n` +
+        `✅ *Success:* \`${broadcastState.success}\`\n` +
+        `❌ *Failed:* \`${broadcastState.failed}\`\n` +
+        `👥 *Processed:* \`${broadcastState.current}\` / \`${broadcastState.total}\`\n` +
+        `⏱️ *Elapsed:* \`${duration}s\``,
         { parse_mode: 'Markdown' }
     );
+});
+
+// Broadcast cancel
+bot.command('broadcast_cancel', async (ctx) => {
+    if (!isAdmin(ctx.from.id)) return;
+    if (!broadcastState.isActive) return ctx.reply('ℹ️ No active broadcast to cancel.');
+
+    broadcastState.cancelRequested = true;
+    await ctx.reply('🛑 *Cancellation request sent. Broadcast will stop shortly.*', { parse_mode: 'Markdown' });
 });
 
 // Link generator for Dump Channel
