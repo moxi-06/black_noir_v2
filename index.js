@@ -131,6 +131,39 @@ async function connectDB() {
         settingsCollection = db.collection('settings');
         blockedKeywordsCollection = db.collection('blocked_keywords');
 
+        // Activity Logger Middleware
+        bot.use(async (ctx, next) => {
+            const userId = ctx.from?.id;
+            const firstName = ctx.from?.first_name || 'Unknown';
+            const chatType = ctx.chat?.type;
+
+            if (ctx.message || ctx.callbackQuery) {
+                let logMsg = `👤 *Activity:* ${firstName} (\`${userId}\`)\n` +
+                    `📍 *Type:* ${chatType}\n`;
+
+                if (ctx.message?.text) {
+                    logMsg += `📝 *Text:* \`${ctx.message.text.substring(0, 100)}\``;
+                } else if (ctx.callbackQuery?.data) {
+                    logMsg += `🔘 *Button:* \`${ctx.callbackQuery.data}\``;
+                }
+
+                // Log to console for debugging
+                console.log(`[User Activity] ${firstName} (${userId}) in ${chatType}: ${ctx.message?.text || ctx.callbackQuery?.data}`);
+
+                // Only send important actions to Telegram log channel to avoid spam
+                const importantCommands = ['/start', '/broadcast', '/admin', '/delete', '/stats', '/link'];
+                const text = ctx.message?.text || '';
+                const isImportant = importantCommands.some(cmd => text.startsWith(cmd)) ||
+                    (text.startsWith('/') && ctx.chat?.type === 'private') ||
+                    (ctx.callbackQuery?.data && !ctx.callbackQuery.data.startsWith('p:')); // Exclude pagination
+
+                if (isImportant && LOG_CHANNEL_ID) {
+                    sendLog(logMsg).catch(() => { });
+                }
+            }
+            return next();
+        });
+
         // Load settings
         const mnt = await settingsCollection.findOne({ key: 'maintenance' });
         if (mnt) IS_MAINTENANCE = mnt.value;
@@ -1236,9 +1269,15 @@ bot.command('broadcast', async (ctx) => {
         return ctx.reply('⚠️ *Broadcast already in progress!* \n\nUse `/broadcast_status` to check progress or `/broadcast_cancel` to stop it.', { parse_mode: 'Markdown' });
     }
 
+    const args = ctx.message.text.split(' ');
+    let deleteTimerMins = parseInt(args[1]);
+    if (isNaN(deleteTimerMins) || deleteTimerMins <= 0) {
+        deleteTimerMins = 0; // No auto-delete by default or if invalid
+    }
+
     const message = ctx.message.reply_to_message;
     if (!message) {
-        return ctx.reply('❌ Reply to a message to broadcast it.');
+        return ctx.reply('❌ Reply to a message to broadcast it.\n\nUsage: `/broadcast [minutes]`');
     }
 
     const users = await usersCollection.find({}).toArray();
@@ -1254,10 +1293,12 @@ bot.command('broadcast', async (ctx) => {
         startTime: Date.now(),
         cancelRequested: false,
         messageId: message.message_id,
-        chatId: ctx.chat.id
+        chatId: ctx.chat.id,
+        deleteTimerMins
     };
 
-    const statusMsg = await ctx.reply(`⏳ *Starting Broadcast...*\n\n👥 *Target Users:* \`${users.length}\``, { parse_mode: 'Markdown' });
+    const timerText = deleteTimerMins > 0 ? `⏰ *Auto-delete:* \`${deleteTimerMins} mins\`` : '🚫 *Auto-delete:* `Disabled`';
+    const statusMsg = await ctx.reply(`⏳ *Starting Broadcast...*\n\n👥 *Target:* \`${users.length}\`\n${timerText}`, { parse_mode: 'Markdown' });
 
     // Run in background
     (async () => {
@@ -1265,18 +1306,25 @@ bot.command('broadcast', async (ctx) => {
             if (broadcastState.cancelRequested) break;
 
             try {
-                await ctx.telegram.copyMessage(user.user_id, broadcastState.chatId, broadcastState.messageId);
+                const sent = await ctx.telegram.copyMessage(user.user_id, broadcastState.chatId, broadcastState.messageId);
                 broadcastState.success++;
+
+                // Individual auto-delete if timer is set
+                if (deleteTimerMins > 0) {
+                    setTimeout(() => {
+                        ctx.telegram.deleteMessage(user.user_id, sent.message_id).catch(() => { });
+                    }, deleteTimerMins * 60 * 1000);
+                }
             } catch (error) {
                 broadcastState.failed++;
             }
             broadcastState.current++;
 
-            // Rate limit: ~20-30 msgs/sec is safe for Telegram
-            await new Promise(r => setTimeout(r, 50));
+            // Rate limit: ~20-30 msgs/sec is safe
+            await new Promise(r => setTimeout(r, 40));
 
-            // Update status every 50 users
-            if (broadcastState.current % 50 === 0) {
+            // Update status every 100 users
+            if (broadcastState.current % 100 === 0) {
                 const progress = ((broadcastState.current / broadcastState.total) * 100).toFixed(1);
                 await ctx.telegram.editMessageText(
                     ctx.chat.id,
@@ -1285,9 +1333,8 @@ bot.command('broadcast', async (ctx) => {
                     `⏳ *Broadcasting...*\n\n` +
                     `📊 *Progress:* ${progress}%\n` +
                     `✅ *Success:* \`${broadcastState.success}\`\n` +
-                    `❌ *Failed:* \`${broadcastState.failed}\`\n` +
                     `👥 *Current:* \`${broadcastState.current}\` / \`${broadcastState.total}\`\n\n` +
-                    `_Use /broadcast_status for live updates!_`,
+                    `${timerText}`,
                     { parse_mode: 'Markdown' }
                 ).catch(() => { });
             }
@@ -1304,7 +1351,8 @@ bot.command('broadcast', async (ctx) => {
             `⏱️ *Time Taken:* \`${duration}s\`\n` +
             `✅ *Success:* \`${broadcastState.success}\`\n` +
             `❌ *Failed:* \`${broadcastState.failed}\`\n` +
-            `👥 *Total:* \`${broadcastState.current}\``,
+            `👥 *Total:* \`${broadcastState.current}\`\n` +
+            `${timerText}`,
             { parse_mode: 'Markdown' }
         ).catch(() => { });
 
@@ -1319,6 +1367,7 @@ bot.command('broadcast_status', async (ctx) => {
 
     const progress = ((broadcastState.current / broadcastState.total) * 100).toFixed(1);
     const duration = ((Date.now() - broadcastState.startTime) / 1000).toFixed(1);
+    const timerText = broadcastState.deleteTimerMins > 0 ? `\n⏰ *Auto-delete:* \`${broadcastState.deleteTimerMins} mins\`` : '';
 
     await ctx.reply(
         `📊 *Broadcast Live Status*\n\n` +
@@ -1326,7 +1375,7 @@ bot.command('broadcast_status', async (ctx) => {
         `✅ *Success:* \`${broadcastState.success}\`\n` +
         `❌ *Failed:* \`${broadcastState.failed}\`\n` +
         `👥 *Processed:* \`${broadcastState.current}\` / \`${broadcastState.total}\`\n` +
-        `⏱️ *Elapsed:* \`${duration}s\``,
+        `⏱️ *Elapsed:* \`${duration}s\`${timerText}`,
         { parse_mode: 'Markdown' }
     );
 });
@@ -1709,6 +1758,9 @@ async function handleStatelessBatch(ctx, payload) {
 
 // Helper: Handle Dump Channel Batch Link
 async function handleDumpBatch(ctx, payload) {
+    const triggerMsgId = ctx.message?.message_id;
+    let loadingMsg;
+
     try {
         const decodedString = Buffer.from(payload, 'base64url').toString('utf8');
         const data = JSON.parse(decodedString);
@@ -1718,7 +1770,7 @@ async function handleDumpBatch(ctx, payload) {
 
         if (isNaN(start) || isNaN(end)) throw new Error('Invalid IDs');
 
-        await ctx.reply(`📥 *Fetching your files...*\n\n_Please wait while we prepare your delivery..._`, { parse_mode: 'Markdown' });
+        loadingMsg = await ctx.reply(`📥 *Fetching your files...*\n\n_Please wait while we prepare your delivery..._`, { parse_mode: 'Markdown' });
 
         // Force Subscribe Check
         const subscribed = await isSubscribed(ctx.from.id);
@@ -1744,23 +1796,12 @@ async function handleDumpBatch(ctx, payload) {
                     console.error('Error forwarding batch monetization post:', e.message);
                 }
             }
-        } else if (IS_GROWTH_LOCK) {
-            console.log(`📡 Batch Monetization skipped: CHAN=${!!monetizationChannel}, POST_ID=${!!LAST_MONETIZATION_POST_ID}`);
         }
 
         const sentMessages = [];
-        const deleteInMins = Math.floor(AUTO_DELETE_SECONDS / 60);
-
         for (let mid = start; mid <= end; mid++) {
             try {
-                // We use copyMessage to send files without forwarding tag
                 const sent = await ctx.telegram.copyMessage(ctx.from.id, chatId, mid);
-
-                // If it's a file, we can append auto-delete info if it has a caption or even if it doesn't
-                // But copyMessage clones the message exactly. 
-                // To add custom caption, we'd need to send it separately or edit it if possible (expensive)
-                // For now, let's keep it simple and just copy.
-
                 sentMessages.push(sent.message_id);
             } catch (err) {
                 console.error(`Failed to copy message ${mid} from ${chatId}:`, err.message);
@@ -1771,13 +1812,44 @@ async function handleDumpBatch(ctx, payload) {
             return ctx.reply('❌ Error: Could not retrieve files. These messages might have been deleted from the dump channel.');
         }
 
-        // Auto-delete logic
+        // Final delivery confirmation
+        const finalMsg = await ctx.reply(
+            `✅ *All files delivered!*\n\n` +
+            `📦 *Total Files:* \`${sentMessages.length}\`\n` +
+            `⚠️ _This entire session will be cleared in 60 minutes to keep your chat clean._`,
+            { parse_mode: 'Markdown' }
+        );
+
+        // Comprehensive Log
+        await sendLog(
+            `📥 *File Store Delivery*\n\n` +
+            `👤 *User:* ${ctx.from.first_name} (\`${ctx.from.id}\`)\n` +
+            `📦 *Files:* \`${sentMessages.length}\`\n` +
+            `📍 *Source:* \`${chatId}\`\n` +
+            `⏰ *Cleanup:* 60 mins`
+        ).catch(() => { });
+
+        // Thorough PM Cleanup after 60 minutes
         setTimeout(async () => {
-            for (const msgId of sentMessages) {
-                try { await ctx.telegram.deleteMessage(ctx.from.id, msgId); } catch (e) { }
-            }
-            const delNotify = await ctx.telegram.sendMessage(ctx.from.id, `❌ *Files Deleted!* \n\n_Auto-clean active for your privacy._`, { parse_mode: 'Markdown' });
-            setTimeout(() => ctx.telegram.deleteMessage(ctx.from.id, delNotify.message_id).catch(() => { }), 8000);
+            try {
+                // 1. Delete trigger message (/start)
+                if (triggerMsgId) await ctx.telegram.deleteMessage(ctx.chat.id, triggerMsgId).catch(() => { });
+
+                // 2. Delete loading message
+                if (loadingMsg) await ctx.telegram.deleteMessage(ctx.chat.id, loadingMsg.message_id).catch(() => { });
+
+                // 3. Delete all files
+                for (const msgId of sentMessages) {
+                    await ctx.telegram.deleteMessage(ctx.from.id, msgId).catch(() => { });
+                }
+
+                // 4. Delete final confirmation
+                await ctx.telegram.deleteMessage(ctx.chat.id, finalMsg.message_id).catch(() => { });
+
+                // 5. Send one last "Cleaned" message
+                const cleanedMsg = await ctx.telegram.sendMessage(ctx.from.id, `❌ *PM session cleared!* \n\n_Everything removed to keep your space clean._`, { parse_mode: 'Markdown' });
+                setTimeout(() => ctx.telegram.deleteMessage(ctx.from.id, cleanedMsg.message_id).catch(() => { }), 10000);
+            } catch (e) { }
         }, AUTO_DELETE_SECONDS * 1000);
 
     } catch (error) {
@@ -2327,8 +2399,16 @@ bot.on('text', async (ctx) => {
 });
 
 // Handle errors
-bot.catch((err, ctx) => {
-    console.error('Bot error:', err);
+bot.catch(async (err, ctx) => {
+    console.error('Critical Bot Error:', err);
+    if (LOG_CHANNEL_ID) {
+        const errorMsg = `🚨 *Critical Bot Error*\n\n` +
+            `👤 *User:* ${ctx.from?.first_name} (\`${ctx.from?.id}\`)\n` +
+            `📍 *Update Type:* ${ctx.updateType}\n` +
+            `⚠️ *Error:* \`${err.message}\`\n\n` +
+            `\`\`\`\n${err.stack?.substring(0, 500)}...\n\`\`\``;
+        await sendLog(errorMsg).catch(() => { });
+    }
 });
 
 // Start the bot
