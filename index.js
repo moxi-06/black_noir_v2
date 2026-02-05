@@ -448,16 +448,39 @@ async function trackSearch(query) {
     }
 }
 
-// Helper: Get database stats
 async function getDatabaseStats() {
     try {
         const stats = await db.stats();
         const fileCount = await filesCollection.countDocuments();
         const userCount = await usersCollection.countDocuments();
 
+        // Advanced Analytics
+        const now = new Date();
+        const past24h = new Date(now.getTime() - (24 * 60 * 60 * 1000));
+
+        const usersToday = await usersCollection.countDocuments({ joined_at: { $gt: past24h } });
+        const activeToday = await usersCollection.countDocuments({ last_seen: { $gt: past24h } });
+        const premiumUsers = await usersCollection.countDocuments({ isPremium: true });
+
+        // aggregate total referrals
+        const referralResult = await usersCollection.aggregate([
+            { $group: { _id: null, total: { $sum: "$referrals" } } }
+        ]).toArray();
+        const totalReferrals = referralResult[0]?.total || 0;
+
+        // Top Trending Searches
+        const topTrending = await trendingCollection.find({}).sort({ count: -1 }).limit(5).toArray();
+        const topRequests = await requestsCollection.find({}).sort({ count: -1 }).limit(5).toArray();
+
         return {
             totalFiles: fileCount,
             totalUsers: userCount,
+            usersToday,
+            activeToday,
+            premiumUsers,
+            totalReferrals,
+            topTrending,
+            topRequests,
             sizeInMB: (stats.dataSize / (1024 * 1024)).toFixed(2),
             storageSizeInMB: (stats.storageSize / (1024 * 1024)).toFixed(2)
         };
@@ -1198,10 +1221,10 @@ async function getTrendingText() {
     }
 }
 
-// Handle /stats command (admin only)
-bot.command('stats', async (ctx) => {
+// Helper: Send Advanced Stats
+async function sendStats(ctx, isEdit = false) {
     if (!isAdmin(ctx.from.id)) {
-        await ctx.reply('⛔ This command is only available for admins.');
+        if (!isEdit) await ctx.reply('⛔ This command is only available for admins.');
         return;
     }
 
@@ -1209,55 +1232,63 @@ bot.command('stats', async (ctx) => {
     const uptime = getUptime();
 
     if (stats) {
-        const statsText = `📊 *Bot Statistics*
+        const trendingText = stats.topTrending.length > 0
+            ? stats.topTrending.map((t, i) => `   ${i + 1}. \`${t.query}\` (${t.count})`).join('\n')
+            : '   _No searches yet_';
 
-⏱️ *Uptime:* ${uptime}
-📁 *Total Files:* ${stats.totalFiles}
-💾 *Database Size:* ${stats.sizeInMB} MB
+        const requestsText = stats.topRequests.length > 0
+            ? stats.topRequests.map((r, i) => `   ${i + 1}. \`${r.query}\` (${r.count})`).join('\n')
+            : '   _No requests yet_';
 
-🤖 *Bot Info:*
-👤 Admin: ${ctx.from.first_name}
-🆔 User ID: ${ctx.from.id}`;
+        const statsText = `📊 *Noir Advanced Analytics* 💎\n` +
+            `━━━━━━━━━━━━━━━━━━━━━━\n\n` +
+            `⏱️ *System Uptime:* \`${uptime}\`\n\n` +
+            `👥 *User Demographics* 
+            ├ Total Users: \`${stats.totalUsers}\`
+            ├ New (24h): \`${stats.usersToday}\`
+            ├ Active (24h): \`${stats.activeToday}\`
+            ├ Premium: \`${stats.premiumUsers}\`
+            └ Total Referrals: \`${stats.totalReferrals}\`\n\n` +
+            `📂 *Database Metrics*
+            ├ Total Files: \`${stats.totalFiles}\`
+            ├ Data Size: \`${stats.sizeInMB} MB\`
+            └ Storage: \`${stats.storageSizeInMB} MB\`\n\n` +
+            `🔥 *Top 5 Searches (24h)*\n${trendingText}\n\n` +
+            `🆘 *Top 5 Member Requests*\n${requestsText}\n\n` +
+            `━━━━━━━━━━━━━━━━━━━━━━\n` +
+            `👤 *Admin:* ${ctx.from.first_name} (\`${ctx.from.id}\`)`;
 
         const keyboard = Markup.inlineKeyboard([
+            [Markup.button.callback('🔄 Refresh Stats', 'refresh_stats')],
             [Markup.button.callback('🔙 Back', 'show_home')]
         ]);
 
-        if (ctx.updateType === 'callback_query') {
-            await ctx.editMessageText(statsText, { parse_mode: 'Markdown', ...keyboard });
-            await ctx.answerCbQuery();
+        if (isEdit) {
+            await ctx.editMessageText(statsText, { parse_mode: 'Markdown', ...keyboard }).catch(() => { });
+            await ctx.answerCbQuery('Stats Updated!');
         } else {
             await ctx.reply(statsText, { parse_mode: 'Markdown', ...keyboard });
         }
     } else {
-        await ctx.answerCbQuery('Error fetching stats');
+        const errMsg = '❌ Error fetching analytics from database.';
+        if (isEdit) await ctx.editMessageText(errMsg).catch(() => { });
+        else await ctx.reply(errMsg);
     }
+}
+
+// Handle /stats command (admin only)
+bot.command('stats', async (ctx) => {
+    await sendStats(ctx, false);
 });
 
-// Handle show_stats button callback
+// Handle stats refresh action
+bot.action('refresh_stats', async (ctx) => {
+    await sendStats(ctx, true);
+});
+
+// Handle show_stats action
 bot.action('show_stats', async (ctx) => {
-    const stats = await getDatabaseStats();
-    const uptime = getUptime();
-
-    if (stats) {
-        const statsText = `📊 *Bot Statistics*
-
-⏱️ *Uptime:* ${uptime}
-📁 *Total Files:* ${stats.totalFiles}
-💾 *Database Size:* ${stats.sizeInMB} MB
-
-👤 User: ${ctx.from.first_name}
-🆔 ID: ${ctx.from.id}`;
-
-        const keyboard = Markup.inlineKeyboard([
-            [Markup.button.callback('🔙 Back', 'show_home')]
-        ]);
-
-        await ctx.editMessageText(statsText, { parse_mode: 'Markdown', ...keyboard });
-        await ctx.answerCbQuery();
-    } else {
-        await ctx.answerCbQuery('Error fetching stats');
-    }
+    await sendStats(ctx, true);
 });
 
 // Handle referral button
