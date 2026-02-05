@@ -2,6 +2,7 @@ require('dotenv').config();
 const { Telegraf, Markup } = require('telegraf');
 const { MongoClient } = require('mongodb');
 const Fuse = require('fuse.js');
+const axios = require('axios');
 const { searchWebsite } = require('./scrapper/scraper');
 
 // Configuration
@@ -16,6 +17,7 @@ const LOG_CHANNEL_ID = process.env.LOG_CHANNEL_ID ? parseInt(process.env.LOG_CHA
 const FSUB_CHANNEL_ID = process.env.FSUB_CHANNEL_ID ? parseInt(process.env.FSUB_CHANNEL_ID) : null;
 const MONETIZATION_CHANNEL_ID = process.env.MONETIZATION_CHANNEL_ID ? parseInt(process.env.MONETIZATION_CHANNEL_ID) : null;
 const FSUB_LINK = process.env.FSUB_LINK || '';
+const DOWNLOAD_API = process.env.DOWNLOAD_API || 'https://cobalt.hypertube.xyz/api/json';
 
 // God-Mode Configs
 let IS_MAINTENANCE = process.env.IS_MAINTENANCE === 'true';
@@ -333,6 +335,32 @@ async function isPremium(userId) {
     return user ? !!user.isPremium : false;
 }
 
+// Helper: Trigger Monetization (Forward Ad Post)
+async function triggerMonetization(ctx) {
+    if (!IS_GROWTH_LOCK) return;
+
+    const monetizationChannel = MONETIZATION_CHANNEL_ID || FSUB_CHANNEL_ID;
+    if (!monetizationChannel || !LAST_MONETIZATION_POST_ID) {
+        console.log(`📡 Monetization skipped: CHAN=${!!monetizationChannel}, POST_ID=${!!LAST_MONETIZATION_POST_ID}`);
+        return;
+    }
+
+    const userIsPremium = await isPremium(ctx.from.id);
+    if (!userIsPremium) {
+        try {
+            const forwarded = await ctx.telegram.forwardMessage(ctx.from.id, monetizationChannel, LAST_MONETIZATION_POST_ID);
+            // Auto-delete ad after 5 minutes
+            setTimeout(() => {
+                ctx.telegram.deleteMessage(ctx.from.id, forwarded.message_id).catch(() => { });
+            }, 300 * 1000);
+            return true;
+        } catch (e) {
+            console.error('Error forwarding auto-monetization post:', e.message);
+        }
+    }
+    return false;
+}
+
 // Helper: Check if user is banned or bot is in maintenance
 async function checkUser(ctx) {
     if (isAdmin(ctx.from.id)) return true;
@@ -436,6 +464,41 @@ async function getDatabaseStats() {
     } catch (error) {
         console.error('Error getting database stats:', error);
         return null;
+    }
+}
+
+// Helper: Download media using Cobalt API
+async function downloadMedia(url) {
+    try {
+        const response = await axios.post(DOWNLOAD_API, {
+            url: url,
+            videoQuality: '720', // Reasonable quality for Telegram
+            filenameStyle: 'basic'
+        }, {
+            headers: {
+                'Accept': 'application/json',
+                'Content-Type': 'application/json'
+            }
+        });
+
+        if (response.data && response.data.url) {
+            return {
+                success: true,
+                url: response.data.url,
+                status: response.data.status
+            };
+        }
+
+        return {
+            success: false,
+            message: response.data?.text || 'Could not extract download link. Try another link or check if it\'s public.'
+        };
+    } catch (error) {
+        console.error('Download API Error:', error.response?.data || error.message);
+        return {
+            success: false,
+            message: error.response?.data?.text || 'API Error: Connection failed. The service might be busy.'
+        };
     }
 }
 
@@ -1054,24 +1117,8 @@ async function sendFile(ctx, fileId) {
             return;
         }
 
-        // Automatic Monetization: Forward the most recent channel post
-        const monetizationChannel = MONETIZATION_CHANNEL_ID || FSUB_CHANNEL_ID;
-        if (IS_GROWTH_LOCK && monetizationChannel && LAST_MONETIZATION_POST_ID) {
-            const userIsPremium = await isPremium(ctx.from.id);
-            if (!userIsPremium) {
-                try {
-                    const forwarded = await ctx.telegram.forwardMessage(ctx.from.id, monetizationChannel, LAST_MONETIZATION_POST_ID);
-                    // Single-use monetization post: Auto-delete after 5 minutes (300s)
-                    setTimeout(() => {
-                        ctx.telegram.deleteMessage(ctx.from.id, forwarded.message_id).catch(() => { });
-                    }, 300 * 1000);
-                } catch (e) {
-                    console.error('Error forwarding auto-monetization post:', e.message);
-                }
-            }
-        } else if (IS_GROWTH_LOCK) {
-            console.log(`📡 Monetization skipped: CHAN=${!!monetizationChannel}, POST_ID=${!!LAST_MONETIZATION_POST_ID}`);
-        }
+        // Practical Monetization: Forward the most recent ad post
+        await triggerMonetization(ctx);
 
         const keyboard = Markup.inlineKeyboard([
             [Markup.button.url('🍿 Join Main Channel', FSUB_LINK)]
@@ -2330,6 +2377,73 @@ bot.on('my_chat_member', async (ctx) => {
 bot.on('text', async (ctx) => {
     if (!await checkUser(ctx)) return;
     const message = ctx.message.text.trim();
+
+    // Video Downloader: Detect YouTube and Instagram links
+    const ytRegex = /(?:https?:\/\/)?(?:www\.)?(?:youtube\.com|youtu\.be)\/[^\s]+/i;
+    const igRegex = /(?:https?:\/\/)?(?:www\.)?instagram\.com\/(?:reels|p|reel|tv)\/[^\s]+/i;
+
+    if (ytRegex.test(message) || igRegex.test(message)) {
+        const link = message.match(ytRegex)?.[0] || message.match(igRegex)?.[0];
+
+        if (link) {
+            // Check Force Subscribe first for Downloader too
+            const subscribed = await isSubscribed(ctx.from.id);
+            if (!subscribed && FSUB_CHANNEL_ID) {
+                const keyboard = Markup.inlineKeyboard([
+                    [Markup.button.url('📢 Join Channel', FSUB_LINK)],
+                    [Markup.button.callback('✅ I Have Joined', 'check_sub')]
+                ]);
+                await ctx.reply(`❌ *Access Denied!*\n\nYou must join our channel to use the Video Downloader.`, { parse_mode: 'Markdown', ...keyboard });
+                return;
+            }
+
+            const waitMsg = await ctx.reply('⏳ *Processing your link... Please wait.*', {
+                parse_mode: 'Markdown',
+                reply_to_message_id: ctx.message.message_id
+            });
+
+            const result = await downloadMedia(link);
+
+            if (result.success) {
+                try {
+                    // Trigger Monetization before sending video
+                    await triggerMonetization(ctx);
+
+                    const videoMsg = await ctx.replyWithVideo(result.url, {
+                        caption: `✅ *Downloaded successfully!*\n\n🔗 *Link:* ${link}\n🤖 @${ctx.botInfo.username}\n\n⏱️ _This message will be deleted in 60 minutes._`,
+                        parse_mode: 'Markdown',
+                        reply_to_message_id: ctx.message.message_id
+                    });
+
+                    await ctx.telegram.deleteMessage(ctx.chat.id, waitMsg.message_id).catch(() => { });
+
+                    // Auto-delete user's link message and the bot's video message after 1 hour
+                    setTimeout(async () => {
+                        try {
+                            // Delete bot's video message
+                            await ctx.telegram.deleteMessage(ctx.chat.id, videoMsg.message_id).catch(() => { });
+                            // Delete user's link message
+                            await ctx.telegram.deleteMessage(ctx.chat.id, ctx.message.message_id).catch(() => { });
+                        } catch (e) {
+                            console.error('Auto-delete error (Video Downloader):', e.message);
+                        }
+                    }, AUTO_DELETE_SECONDS * 1000);
+
+                } catch (err) {
+                    console.error('Error sending video:', err.message);
+                    await ctx.telegram.editMessageText(ctx.chat.id, waitMsg.message_id, null, '❌ *Failed to send video.* The file might be too large or the link expired.', { parse_mode: 'Markdown' });
+                }
+            } else {
+                await ctx.telegram.editMessageText(ctx.chat.id, waitMsg.message_id, null, `❌ *Error:* ${result.message}`, { parse_mode: 'Markdown' });
+                // Delete user's link message after some time even if it fails? 
+                // Let's just delete the error message after 30 seconds for cleanliness
+                setTimeout(() => {
+                    ctx.telegram.deleteMessage(ctx.chat.id, waitMsg.message_id).catch(() => { });
+                }, 30000);
+            }
+            return; // Stop processing further (no movie search)
+        }
+    }
 
     // Group Anti-Link: Delete links from non-admins
     if (ctx.chat.type !== 'private') {
