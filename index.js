@@ -1,7 +1,7 @@
 require('dotenv').config();
 const { Telegraf, Markup } = require('telegraf');
 const { MongoClient } = require('mongodb');
-const Fuse = require('fuse.js');
+const { downloadDirect, downloadTorrent, uploadFile } = require('./leech');
 const axios = require('axios');
 const { searchWebsite } = require('./scrapper/scraper');
 
@@ -986,6 +986,40 @@ async function sendWebResults(ctx, searchId, page, isEdit = false) {
         await ctx.reply(text, { parse_mode: 'HTML', disable_web_page_preview: true, ...keyboard });
     }
 }
+
+// Leech Command (Direct Link)
+bot.command('l', async (ctx) => {
+    if (!await checkUser(ctx)) return;
+    const url = ctx.message.text.split(' ')[1];
+
+    if (!url) {
+        return ctx.reply('❌ Please provide a direct download link.\nUsage: `/l https://example.com/file.zip`', { parse_mode: 'Markdown' });
+    }
+
+    try {
+        const { filePath, fileName, statusMsg } = await downloadDirect(url, ctx);
+        await uploadFile(filePath, fileName, ctx, statusMsg);
+    } catch (e) {
+        console.error('Leech Error:', e.message);
+    }
+});
+
+// Torrent Command (Magnet Link)
+bot.command('ql', async (ctx) => {
+    if (!await checkUser(ctx)) return;
+    const magnet = ctx.message.text.split(' ')[1];
+
+    if (!magnet || !magnet.startsWith('magnet:?')) {
+        return ctx.reply('❌ Please provide a valid magnet link.\nUsage: `/ql magnet:?xt=...`', { parse_mode: 'Markdown' });
+    }
+
+    try {
+        const { filePath, fileName, statusMsg } = await downloadTorrent(magnet, ctx);
+        await uploadFile(filePath, fileName, ctx, statusMsg);
+    } catch (e) {
+        console.error('Torrent Error:', e.message);
+    }
+});
 
 // Handle /search command (Web Scraping)
 bot.command('search', async (ctx) => {
