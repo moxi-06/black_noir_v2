@@ -17,7 +17,7 @@ const LOG_CHANNEL_ID = process.env.LOG_CHANNEL_ID ? parseInt(process.env.LOG_CHA
 const FSUB_CHANNEL_ID = process.env.FSUB_CHANNEL_ID ? parseInt(process.env.FSUB_CHANNEL_ID) : null;
 const MONETIZATION_CHANNEL_ID = process.env.MONETIZATION_CHANNEL_ID ? parseInt(process.env.MONETIZATION_CHANNEL_ID) : null;
 const FSUB_LINK = process.env.FSUB_LINK || '';
-const DOWNLOAD_API = process.env.DOWNLOAD_API || 'https://cobalt.hypertube.xyz/api/json';
+const DOWNLOAD_API = process.env.DOWNLOAD_API || 'https://cobalt.hypertube.xyz/api/json'; // Note: If this instance fails, change it via .env or Koyeb variables.
 
 // God-Mode Configs
 let IS_MAINTENANCE = process.env.IS_MAINTENANCE === 'true';
@@ -494,20 +494,20 @@ async function getDatabaseStats() {
 async function downloadMedia(url) {
     try {
         const response = await axios.post(DOWNLOAD_API, {
-            url: url,
-            videoQuality: '720', // Reasonable quality for Telegram
-            filenameStyle: 'basic'
+            url: url
         }, {
             headers: {
                 'Accept': 'application/json',
-                'Content-Type': 'application/json'
-            }
+                'Content-Type': 'application/json',
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+            },
+            timeout: 15000
         });
 
-        if (response.data && response.data.url) {
+        if (response.data && (response.data.url || response.data.status === 'stream' || response.data.status === 'redirect')) {
             return {
                 success: true,
-                url: response.data.url,
+                url: response.data.url || response.data.redirect,
                 status: response.data.status
             };
         }
@@ -520,7 +520,7 @@ async function downloadMedia(url) {
         console.error('Download API Error:', error.response?.data || error.message);
         return {
             success: false,
-            message: error.response?.data?.text || 'API Error: Connection failed. The service might be busy.'
+            message: error.response?.data?.text || error.response?.data?.error?.code || 'API Error: Connection failed. The service might be busy.'
         };
     }
 }
