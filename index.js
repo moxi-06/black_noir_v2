@@ -1,7 +1,6 @@
 require('dotenv').config();
 const { Telegraf, Markup } = require('telegraf');
 const { MongoClient } = require('mongodb');
-const { downloadDirect, downloadTorrent, uploadFile } = require('./leech');
 const axios = require('axios');
 const { searchWebsite } = require('./scrapper/scraper');
 
@@ -17,7 +16,7 @@ const LOG_CHANNEL_ID = process.env.LOG_CHANNEL_ID ? parseInt(process.env.LOG_CHA
 const FSUB_CHANNEL_ID = process.env.FSUB_CHANNEL_ID ? parseInt(process.env.FSUB_CHANNEL_ID) : null;
 const MONETIZATION_CHANNEL_ID = process.env.MONETIZATION_CHANNEL_ID ? parseInt(process.env.MONETIZATION_CHANNEL_ID) : null;
 const FSUB_LINK = process.env.FSUB_LINK || '';
-const DOWNLOAD_API = process.env.DOWNLOAD_API || 'https://cobalt.hypertube.xyz/api/json'; // Note: If this instance fails, change it via .env or Koyeb variables.
+
 
 // God-Mode Configs
 let IS_MAINTENANCE = process.env.IS_MAINTENANCE === 'true';
@@ -490,40 +489,7 @@ async function getDatabaseStats() {
     }
 }
 
-// Helper: Download media using Cobalt API
-async function downloadMedia(url) {
-    try {
-        const response = await axios.post(DOWNLOAD_API, {
-            url: url
-        }, {
-            headers: {
-                'Accept': 'application/json',
-                'Content-Type': 'application/json',
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-            },
-            timeout: 15000
-        });
 
-        if (response.data && (response.data.url || response.data.status === 'stream' || response.data.status === 'redirect')) {
-            return {
-                success: true,
-                url: response.data.url || response.data.redirect,
-                status: response.data.status
-            };
-        }
-
-        return {
-            success: false,
-            message: response.data?.text || 'Could not extract download link. Try another link or check if it\'s public.'
-        };
-    } catch (error) {
-        console.error('Download API Error:', error.response?.data || error.message);
-        return {
-            success: false,
-            message: error.response?.data?.text || error.response?.data?.error?.code || 'API Error: Connection failed. The service might be busy.'
-        };
-    }
-}
 
 // Search files in MongoDB with fuzzy matching
 async function searchFiles(query, page = 0, filters = {}) {
@@ -987,38 +953,26 @@ async function sendWebResults(ctx, searchId, page, isEdit = false) {
     }
 }
 
-// Leech Command (Direct Link)
-bot.command('l', async (ctx) => {
+
+
+// Normal Document Handler
+bot.on('document', async (ctx) => {
     if (!await checkUser(ctx)) return;
-    const url = ctx.message.text.split(' ')[1];
+    if (ctx.chat.type !== 'private') return;
 
-    if (!url) {
-        return ctx.reply('❌ Please provide a direct download link.\nUsage: `/l https://example.com/file.zip`', { parse_mode: 'Markdown' });
-    }
-
-    try {
-        const { filePath, fileName, statusMsg } = await downloadDirect(url, ctx);
-        await uploadFile(filePath, fileName, ctx, statusMsg);
-    } catch (e) {
-        console.error('Leech Error:', e.message);
-    }
-});
-
-// Torrent Command (Magnet Link)
-bot.command('ql', async (ctx) => {
-    if (!await checkUser(ctx)) return;
-    const magnet = ctx.message.text.split(' ')[1];
-
-    if (!magnet || !magnet.startsWith('magnet:?')) {
-        return ctx.reply('❌ Please provide a valid magnet link.\nUsage: `/ql magnet:?xt=...`', { parse_mode: 'Markdown' });
-    }
-
-    try {
-        const { filePath, fileName, statusMsg } = await downloadTorrent(magnet, ctx);
-        await uploadFile(filePath, fileName, ctx, statusMsg);
-    } catch (e) {
-        console.error('Torrent Error:', e.message);
-    }
+    const doc = ctx.message.document;
+    // Normal indexing or other attachment logic
+    return indexFile({
+        file_id: doc.file_id,
+        file_unique_id: doc.file_unique_id,
+        file_name: doc.file_name,
+        file_size: doc.file_size,
+        mime_type: doc.mime_type,
+        file_type: 'document',
+        caption: ctx.message.caption || ''
+    }).then(res => {
+        if (res.success) ctx.reply(`✅ File indexed: ${doc.file_name}`).catch(() => { });
+    });
 });
 
 // Handle /search command (Web Scraping)
